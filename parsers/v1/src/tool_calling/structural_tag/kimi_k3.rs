@@ -460,6 +460,45 @@ fn auto_argument_format(
     }))
 }
 
+/// A declared-but-loosely-typed argument tag for one specific property.
+///
+/// The key is baked into `begin`, so unlike [`permissive_argument_tag`] this
+/// cannot stand in for a *different* key — in particular it can never repeat a
+/// required key and overwrite its constrained value, which is what made an
+/// unbounded `AnyText` tail unusable here. The `type` attribute is restricted to
+/// the xtml names the property's schema actually admits, and only the body is
+/// left free.
+fn typed_choice_argument_tag(key: &str, xtml_types: &[&'static str]) -> TagFormat {
+    let alternatives = xtml_types.join("|");
+    TagFormat {
+        begin: format!("{OPEN}argument key=\"{}\" type=\"", escape_attr(key)),
+        content: Box::new(Format::Sequence(SequenceFormat {
+            elements: vec![
+                Format::Regex(RegexFormat {
+                    pattern: format!("(?:{alternatives})\"{}", SEP.replace('|', r"\|")),
+                }),
+                Format::AnyText(AnyTextFormat {
+                    excludes: vec![CLOSE.to_string()],
+                }),
+            ],
+        })),
+        end: ARGUMENT_CLOSE.to_string(),
+    }
+}
+
+/// The distinct xtml type names a property's schema admits, in `JSON_TYPES`
+/// order. Empty when the schema accepts nothing at all (`false`).
+fn admissible_xtml_types(schema: &Value, root: &Value) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for json_type in schema_types(schema, root, &HashSet::new()) {
+        let name = json_type.xtml_name();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn optional_auto_arguments(
     properties: &Map<String, Value>,
     required_keys: &[&str],
@@ -469,10 +508,22 @@ fn optional_auto_arguments(
     let arguments = properties
         .iter()
         .filter(|(key, _)| !required_keys.contains(&key.as_str()))
+        .filter(|(_, schema)| matches!(schema, Value::Bool(_) | Value::Object(_)))
         .filter_map(|(key, schema)| {
-            matches!(schema, Value::Bool(_) | Value::Object(_))
-                .then(|| auto_argument_format(key, schema, root, root_defs, false))
-                .flatten()
+            if let Some(argument) = auto_argument_format(key, schema, root, root_defs, false) {
+                return Some(argument);
+            }
+            // No single xtml type: `anyOf: [{"type": "string"}, {"type":
+            // "null"}]` (Pydantic's `Optional[X]`), a description-only property,
+            // an explicit multi-type list. Dropping these made them unemittable
+            // — the model had no grammar path to the argument at all. Give each
+            // one a permissive tag of its own instead, as the required and
+            // named-choice paths already do with `arguments_block(None)` and
+            // `permissive_argument_tag`.
+            let xtml_types = admissible_xtml_types(schema, root);
+            // A `false` schema admits no value, so there is nothing to emit.
+            (!xtml_types.is_empty())
+                .then(|| Format::Tag(typed_choice_argument_tag(key, &xtml_types)))
         })
         .collect::<Vec<_>>();
 
@@ -1005,6 +1056,158 @@ mod tests {
         );
         assert_eq!(alternatives[1]["content"]["type"], "json_schema");
         assert_eq!(alternatives[1]["content"]["json_schema"]["type"], "integer");
+    }
+
+    // -- Optional arguments that have no single declared type --
+    //
+    // Every tool fixture above uses exclusively single-typed properties, which
+    // is why the drop below went unnoticed. These pin the shapes real tool
+    // declarations actually contain.
+
+    fn auto_arguments(tools: &[ToolDefinition]) -> Value {
+        let choice = ToolChoice::Auto;
+        let value = serde_json::to_value(build_kimi_k3(&context(&choice, tools)).unwrap().unwrap())
+            .unwrap();
+        value["format"]["tags"][0]["content"]["tags"][0]["content"]["elements"][2].clone()
+    }
+
+    #[test]
+    fn optional_any_of_null_property_stays_emittable() {
+        // `anyOf: [X, null]` is what Pydantic emits for `Optional[X]`. It has no
+        // single xtml type, and used to vanish from the grammar entirely.
+        let tools = vec![ToolDefinition {
+            name: "search".to_string(),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "lang": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                },
+                "required": ["query"]
+            })),
+            strict: None,
+        }];
+
+        let arguments = auto_arguments(&tools);
+
+        assert_eq!(arguments["type"], "sequence");
+        assert_eq!(
+            arguments["elements"][0]["begin"],
+            "<|open|>argument key=\"query\" type=\"string\"<|sep|>"
+        );
+        let optional = &arguments["elements"][1];
+        assert_eq!(optional["type"], "star", "optional slot must exist");
+        assert_eq!(
+            optional["content"]["begin"], "<|open|>argument key=\"lang\" type=\"",
+            "lang must have a grammar path of its own"
+        );
+        assert_eq!(
+            optional["content"]["content"]["elements"][0]["pattern"],
+            "(?:string|null)\"<\\|sep\\|>",
+            "only the types the schema admits"
+        );
+    }
+
+    #[test]
+    fn optional_untyped_description_only_property_stays_emittable() {
+        let tools = vec![ToolDefinition {
+            name: "note".to_string(),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "body": {"type": "string"},
+                    "tag": {"description": "anything you like"}
+                },
+                "required": ["body"]
+            })),
+            strict: None,
+        }];
+
+        let arguments = auto_arguments(&tools);
+        let optional = &arguments["elements"][1];
+
+        assert_eq!(
+            optional["content"]["begin"],
+            "<|open|>argument key=\"tag\" type=\"",
+        );
+        assert_eq!(
+            optional["content"]["content"]["elements"][0]["pattern"],
+            "(?:string|number|boolean|array|object|null)\"<\\|sep\\|>",
+            "an untyped property admits every xtml type, deduplicated"
+        );
+    }
+
+    #[test]
+    fn all_optional_multi_typed_tool_is_callable_with_arguments() {
+        // Previously the whole arguments block collapsed to a const empty
+        // string, so the tool could only ever be called with no arguments.
+        let tools = vec![ToolDefinition {
+            name: "configure".to_string(),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "mode": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "retries": {"type": ["integer", "null"]},
+                    "extra": {"description": "freeform"}
+                }
+            })),
+            strict: None,
+        }];
+
+        let arguments = auto_arguments(&tools);
+
+        assert_ne!(
+            arguments["type"], "const_string",
+            "an all-optional multi-typed tool must still accept arguments"
+        );
+        assert_eq!(arguments["type"], "star");
+        let rendered = arguments.to_string();
+        for key in ["mode", "retries", "extra"] {
+            assert!(
+                rendered.contains(&format!("key=\\\"{key}\\\"")),
+                "{key} must be reachable in the grammar: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_permissive_tags_cannot_impersonate_a_required_key() {
+        // The reason this is a per-key tag rather than a bare
+        // `permissive_argument_tag`: an unkeyed permissive tag in the optional
+        // slot could repeat a required key and overwrite its constrained value,
+        // which is the duplicate-emission failure this path must not reopen.
+        let tools = vec![ToolDefinition {
+            name: "search".to_string(),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "lang": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                },
+                "required": ["city"]
+            })),
+            strict: None,
+        }];
+
+        let optional = auto_arguments(&tools)["elements"][1].clone();
+        let rendered = optional.to_string();
+
+        assert_eq!(
+            optional["content"]["begin"], "<|open|>argument key=\"lang\" type=\"",
+            "the optional slot must exist and be keyed to lang"
+        );
+        assert!(
+            !rendered.contains("<|open|>argument \\\""),
+            "no unkeyed permissive tag in the optional slot"
+        );
+        assert!(
+            !rendered.contains("key=\\\"city\\\""),
+            "the optional slot must not be able to re-emit a required key: {rendered}"
+        );
+        assert!(
+            !rendered.contains("any_text\",\"excludes\":[]"),
+            "no unbounded tail"
+        );
     }
 
     #[test]
