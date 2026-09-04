@@ -26,6 +26,7 @@ use super::pythonic::{
     try_tool_call_parse_pythonic,
 };
 use super::response::ToolCallResponse;
+use super::registry::get_tool_call_parser_override;
 use super::xml::{
     detect_tool_call_start_glm47, detect_tool_call_start_kimi_k2,
     detect_tool_call_start_minimax_m3, detect_tool_call_start_xml,
@@ -274,6 +275,11 @@ pub async fn detect_and_parse_tool_call(
         _ => "default", // None or empty string
     };
 
+    // A runtime-registered override shadows the built-in of the same name.
+    if let Some(custom) = get_tool_call_parser_override(parser_key) {
+        return custom.parse(message, tools);
+    }
+
     match parser_map.get(parser_key) {
         Some(config) => {
             let (results, normal_content) = try_tool_call_parse(message, config, tools).await?;
@@ -293,6 +299,10 @@ pub fn detect_tool_call_start(chunk: &str, parser_str: Option<&str>) -> anyhow::
         Some(s) if !s.is_empty() => s,
         _ => "default", // None or empty string
     };
+
+    if let Some(custom) = get_tool_call_parser_override(parser_key) {
+        return Ok(custom.detect_start(chunk));
+    }
 
     match parser_map.get(parser_key) {
         Some(config) => match &config.parser_config {
@@ -342,6 +352,10 @@ pub fn find_tool_call_end_position(chunk: &str, parser_str: Option<&str>) -> Opt
         Some(s) if !s.is_empty() => s,
         _ => "default",
     };
+
+    if let Some(custom) = get_tool_call_parser_override(parser_key) {
+        return custom.find_end(chunk);
+    }
 
     match parser_map.get(parser_key) {
         Some(config) => match &config.parser_config {

@@ -12,6 +12,7 @@ pub mod jail;
 pub mod json;
 pub mod parsers;
 pub mod pythonic;
+pub mod registry;
 pub mod response;
 pub mod structural_tag;
 #[cfg(test)]
@@ -51,6 +52,10 @@ pub use parsers::{
     try_tool_call_parse,
 };
 pub use pythonic::try_tool_call_parse_pythonic;
+pub use registry::{
+    ToolCallParser, get_tool_call_parser_override, is_overridden, register_tool_call_parser,
+    unregister_tool_call_parser,
+};
 pub use response::{
     CalledFunction, CalledFunctionStream, ToolCallResponse, ToolCallResponseChunk, ToolCallType,
 };
