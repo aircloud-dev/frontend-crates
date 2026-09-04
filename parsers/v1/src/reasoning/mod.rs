@@ -63,9 +63,13 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("nemotron_deci", ReasoningParserType::NemotronDeci);
         map.insert("kimi", ReasoningParserType::Kimi);
         map.insert("kimi_k25", ReasoningParserType::KimiK25);
-        // Kimi K3 uses XTML channel markers. The generation prompt normally
-        // consumes the opening `think` channel, so callers should pair this
-        // parser with `set_in_reasoning(true)` when thinking is enabled.
+        // Kimi K3 uses XTML channel markers. The model opens its own channel:
+        // K3's generation prompt stops at
+        // `<|open|>message role="assistant"<|sep|>` and the completion starts
+        // `<|open|>think<|sep|>`, which is why this parser is built with
+        // `force_reasoning = false` and scans for that literal. Do NOT pair it
+        // with `set_in_reasoning(true)` — that is for prompts which prefill the
+        // opener, and it would strand the marker inside the reasoning text.
         map.insert("kimi_k3", ReasoningParserType::KimiK3);
         map.insert("kimi-k3", ReasoningParserType::KimiK3);
         map.insert("step3", ReasoningParserType::Step3);
