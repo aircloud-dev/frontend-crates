@@ -43,16 +43,12 @@ const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 const MEDIA_PAD: &str = "<|media_pad|>";
 const VALID_THINKING_EFFORTS: &[&str] = &["low", "high", "max"];
 
-#[derive(Debug, Clone)]
-pub struct KimiK3Formatter {
-    exclude_tools_when_tool_choice_none: bool,
-}
+#[derive(Debug, Clone, Default)]
+pub struct KimiK3Formatter;
 
 impl KimiK3Formatter {
-    pub fn new(exclude_tools_when_tool_choice_none: bool) -> Self {
-        Self {
-            exclude_tools_when_tool_choice_none,
-        }
+    pub fn new() -> Self {
+        Self
     }
 
     fn build_segments(&self, req: &dyn OAIChatLikeRequest) -> Result<Vec<RenderedSegment>> {
@@ -64,7 +60,7 @@ impl KimiK3Formatter {
 
         let tool_choice = req.tool_choice().map(json_value).transpose()?;
         let (tool_choice_kind, named_tool) = resolve_tool_choice(tool_choice.as_ref())?;
-        let mut tools = req.tools().map(json_value).transpose()?;
+        let tools = req.tools().map(json_value).transpose()?;
         if let Some(named_tool) = named_tool
             && !tools
                 .as_ref()
@@ -75,10 +71,17 @@ impl KimiK3Formatter {
             ))
             .into());
         }
-        if self.exclude_tools_when_tool_choice_none && tool_choice_kind == Some("none") {
-            tools = None;
-        }
-        let tools = tools.map(deep_sort);
+        // `tool_choice=none` never removes the tool-declare block on K3: the
+        // model is told not to call tools by the `tool-choice` internal system
+        // message below, and the declarations stay in the prompt. Both vendored
+        // `tool_choice=none` groundtruth cases (`k3_tool_none` = 227,
+        // `k3_tool_choice_none` = 209) count the declarations; dropping them
+        // undercounts `k3_tool_none` by 94 tokens and renders a prompt the
+        // model was not trained on. This is why the K3 formatter takes no
+        // `exclude_tools_when_tool_choice_none` knob: that switch exists for
+        // jinja templates whose tool instructions would otherwise leak raw tool
+        // markup, and K3's format has its own answer.
+        let tools = tools.map(drop_synthetic_tool_descriptions).map(deep_sort);
 
         let args = req.chat_template_args();
         // Moonshot's K3 API defines named tool choice as incompatible with
@@ -245,6 +248,40 @@ fn internal_system_message(segments: &mut Vec<RenderedSegment>, message_type: &s
     text(segments, body.trim());
     close_tag(segments, "message");
     end_of_msg(segments);
+}
+
+/// Removes the empty `function.description` that the jinja-safety fix-up adds.
+///
+/// [`crate::may_be_fix_tool_schema`] backfills `"description": ""` on every
+/// tool that omits one, because some chat templates concatenate the field
+/// unconditionally and fail on an undefined value. K3 has no template: it
+/// serializes the tool list verbatim into the tool-declare block, so that
+/// backfill lands in the prompt as `"description":"",` — two tokens per tool
+/// that the client never sent and Moonshot never renders. The vendored
+/// `k3_tool_choice_allowed_tools` case (three description-less tools) is
+/// exactly 6 tokens over its groundtruth of 222 without this.
+///
+/// Only the top-level `tools` list is normalized. Tools declared on a system
+/// message (lazy loading) reach the renderer straight off `messages` and never
+/// pass through the fix-up, so an empty description there is the client's own
+/// and is rendered as sent.
+fn drop_synthetic_tool_descriptions(tools: Value) -> Value {
+    let Value::Array(tools) = tools else {
+        return tools;
+    };
+    Value::Array(
+        tools
+            .into_iter()
+            .map(|mut tool| {
+                if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut)
+                    && function.get("description").and_then(Value::as_str) == Some("")
+                {
+                    function.remove("description");
+                }
+                tool
+            })
+            .collect(),
+    )
 }
 
 fn deep_sort(value: Value) -> Value {
@@ -900,15 +937,37 @@ fn build_chat_segments(
     if let Some(partial) = partial_tail {
         render_partial_assistant_segments(&mut segments, partial, thinking)?;
     } else if add_generation_prompt {
+        // The generation prompt stops at the open assistant turn. The channel
+        // opener (`<|open|>think<|sep|>` / `<|open|>response<|sep|>`) is the
+        // model's first three tokens, not the prompt's last three.
+        //
+        // The checkpoint's `encoding_k3.py` does append
+        // `_open_tag("think" if thinking else "response")` here, but Moonshot's
+        // hosted K3 does not, and the hosted API is what the prompt-token
+        // groundtruth measures. Prefilling it puts every prompt exactly 3
+        // tokens over: `<|open|>`, `think`/`response` and `<|sep|>` are one
+        // token each in both modes, which is why the offset was constant. All
+        // 44 vendored `prompt_token_cases` land on their exact
+        // `expected_prompt_tokens` without the opener and 3 over it with —
+        // including the two that pin an exact count (`k3_single_turn_think_off`
+        // = 36, `k3_single_turn_think_on` = 103).
+        //
+        // The parsers already read model output that opens its own channel:
+        // the K3 reasoning parser is built with `force_reasoning = false` and
+        // scans for a literal `<|open|>think<|sep|>`, and the XTML tool parser's
+        // grammar starts at `<|open|>response<|sep|>`. Consumers that used to
+        // compensate for the prefill (Dynamo's `starts_in_reasoning` structural
+        // -tag flag, `ReasoningParser::set_in_reasoning(true)`) must now leave
+        // it false — which is what every in-repo construction already does.
+        //
+        // Kimi Partial Mode is the one case that still prefills a channel, and
+        // for a different reason: its `response` channel has to be open for the
+        // assistant prefix to sit inside it. See
+        // [`render_partial_assistant_segments`].
         open_tag(
             &mut segments,
             "message",
             [("role".to_string(), "assistant".to_string())],
-        );
-        open_tag(
-            &mut segments,
-            if thinking { "think" } else { "response" },
-            [],
         );
     }
 
@@ -973,9 +1032,8 @@ mod tests {
         }
     }
 
-    /// Default formatter: no worker declaration, so the checkpoint token.
     fn fmt() -> KimiK3Formatter {
-        KimiK3Formatter::new(true)
+        KimiK3Formatter::new()
     }
 
     /// One user message carrying a single image part.
@@ -1084,8 +1142,71 @@ mod tests {
             concat!(
                 "<|open|>message role=\"user\"<|sep|>Hello",
                 "<|close|>message<|sep|><|end_of_msg|>",
-                "<|open|>message role=\"assistant\"<|sep|>",
-                "<|open|>response<|sep|>"
+                "<|open|>message role=\"assistant\"<|sep|>"
+            ),
+            "the generation prompt ends at the open assistant turn; the model \
+             opens its own channel"
+        );
+    }
+
+    /// `k3_single_turn_think_off` from Moonshot's `prompt_token_cases`,
+    /// byte-for-byte, pinned as a rendered string.
+    ///
+    /// That case pins an exact `usage.prompt_tokens` of **36**. Encoded with
+    /// the K3 tiktoken vocabulary segment-by-segment (`<|open|>`, `<|sep|>`,
+    /// `<|close|>` and `<|end_of_msg|>` as their special IDs, everything else
+    /// ordinary), this exact string is 36 tokens. With a trailing
+    /// `<|open|>response<|sep|>` it is 39 — the three tokens this renderer used
+    /// to prefill.
+    #[test]
+    fn think_off_generation_prompt_matches_vendored_groundtruth() {
+        let mut request = Request::new(json!([
+            {"role": "system", "content": "你是一个简洁、准确的助手。"},
+            {"role": "user", "content": "你好"}
+        ]));
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        assert_eq!(
+            fmt().render(&request).unwrap(),
+            concat!(
+                "<|open|>message role=\"system\"<|sep|>你是一个简洁、准确的助手。",
+                "<|close|>message<|sep|><|end_of_msg|>",
+                "<|open|>message role=\"user\"<|sep|>你好",
+                "<|close|>message<|sep|><|end_of_msg|>",
+                "<|open|>message role=\"assistant\"<|sep|>"
+            )
+        );
+    }
+
+    /// `k3_single_turn_think_on`: the same messages at `thinking_effort=max`,
+    /// pinning an exact `usage.prompt_tokens` of **103** (36 + the 67-token
+    /// thinking-effort message). The generation prompt is the same either way —
+    /// the channel opener is the model's, not the prompt's, in both modes,
+    /// which is why the old overcount was a constant 3 rather than mode-
+    /// dependent.
+    #[test]
+    fn think_on_generation_prompt_matches_vendored_groundtruth() {
+        let request = Request::new(json!([
+            {"role": "system", "content": "你是一个简洁、准确的助手。"},
+            {"role": "user", "content": "你好"}
+        ]));
+
+        assert_eq!(
+            fmt().render(&request).unwrap(),
+            concat!(
+                "<|open|>message role=\"system\" type=\"thinking-effort\"<|sep|>",
+                "`thinking_effort` guides on how much to think in your thinking channel ",
+                "(not including the response channel), supported values include `low`, ",
+                "`medium`, `high`, and `max`.\n",
+                "Now the system is invoked with `thinking_effort=max`.",
+                "<|close|>message<|sep|><|end_of_msg|>",
+                "<|open|>message role=\"system\"<|sep|>你是一个简洁、准确的助手。",
+                "<|close|>message<|sep|><|end_of_msg|>",
+                "<|open|>message role=\"user\"<|sep|>你好",
+                "<|close|>message<|sep|><|end_of_msg|>",
+                "<|open|>message role=\"assistant\"<|sep|>"
             )
         );
     }
@@ -1406,9 +1527,10 @@ mod tests {
         assert!(rendered.contains(
             "<|open|>response<|sep|>done<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>"
         ));
-        assert!(
-            rendered.ends_with("<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>")
-        );
+        assert!(rendered.ends_with(concat!(
+            "<|close|>message<|sep|><|end_of_msg|>",
+            "<|open|>message role=\"assistant\"<|sep|>"
+        )));
     }
 
     #[test]
@@ -1504,8 +1626,15 @@ mod tests {
         assert!(rendered.contains("The system is invoked with `tool_choice=specified`."));
         assert!(rendered.contains("MUST call the tool `add_numbers`"));
         assert!(
-            rendered.ends_with("<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"),
-            "named tool choice must use K3's non-thinking generation prefix"
+            rendered.ends_with("<|open|>message role=\"assistant\"<|sep|>"),
+            "the generation prompt still ends at the open assistant turn"
+        );
+        // The generation prompt no longer names the channel, so non-thinking
+        // mode shows up in what is *absent*: no thinking-effort instruction,
+        // and no think channel on the historical assistant turn.
+        assert!(
+            !rendered.contains("thinking-effort"),
+            "named tool choice must override thinking=true"
         );
         assert!(
             !rendered.contains("<|open|>think<|sep|>"),
@@ -1592,9 +1721,10 @@ mod tests {
         assert!(
             rendered.contains("<|open|>message role=\"tool\" tool=\"calc\" index=\"1\"<|sep|>4")
         );
-        assert!(
-            rendered.ends_with("<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>")
-        );
+        assert!(rendered.ends_with(concat!(
+            "<|close|>message<|sep|><|end_of_msg|>",
+            "<|open|>message role=\"assistant\"<|sep|>"
+        )));
     }
 
     #[test]
@@ -1637,6 +1767,83 @@ mod tests {
             "<|open|>message role=\"assistant\"<|sep|>",
             "<|open|>response<|sep|>answer<|close|>response<|sep|>"
         )));
+    }
+
+    /// `k3_tool_none` / `k3_tool_choice_none`: the vendored groundtruth counts
+    /// the tool-declare block on both, so `tool_choice=none` must not strip it.
+    /// The `tool-choice` internal system message is what forbids calling them.
+    #[test]
+    fn tool_choice_none_keeps_the_tool_declaration() {
+        let mut request = Request::new(json!([
+            {"role": "user", "content": "What is the weather in Paris?"}
+        ]));
+        request.tools = Some(json!([weather_tool()]));
+        request.tool_choice = Some(json!("none"));
+
+        let rendered = fmt().render(&request).unwrap();
+
+        assert!(
+            rendered.contains("# Tools"),
+            "tool_choice=none still declares tools: {rendered}"
+        );
+        assert!(rendered.contains("Get the weather of a city."));
+        assert!(rendered.contains("The system is invoked with `tool_choice=none`."));
+    }
+
+    /// `k3_tool_choice_allowed_tools` declares three tools with no
+    /// `description`, and its groundtruth of 222 tokens counts none.
+    /// `may_be_fix_tool_schema` hands this renderer `"description": ""` for
+    /// each of them, worth 2 tokens apiece in the tool-declare JSON.
+    #[test]
+    fn synthetic_empty_tool_descriptions_are_not_declared() {
+        let mut request = Request::new(json!([{"role": "user", "content": "hello"}]));
+        // Exactly what `may_be_fix_tool_schema` produces for a description-less
+        // tool.
+        request.tools = Some(json!([{
+            "type": "function",
+            "function": {
+                "name": "foo",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]));
+
+        let rendered = fmt().render(&request).unwrap();
+
+        assert!(
+            rendered.contains(
+                "[{\"function\":{\"name\":\"foo\",\
+                 \"parameters\":{\"properties\":{},\"type\":\"object\"}},\
+                 \"type\":\"function\"}]"
+            ),
+            "an injected empty description must not reach the prompt: {rendered}"
+        );
+    }
+
+    /// The empty-description strip is scoped to the top-level `tools` list,
+    /// which is the only one that passes through `may_be_fix_tool_schema`.
+    /// Lazy-loaded declarations come straight off `messages`, so an empty
+    /// description there is the client's own and is rendered as sent.
+    #[test]
+    fn dynamic_tool_declarations_keep_a_client_sent_empty_description() {
+        let mut request = Request::new(json!([
+            {
+                "role": "system",
+                "content": "",
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "foo", "description": "", "parameters": {"type": "object"}}
+                }]
+            },
+            {"role": "user", "content": "hello"}
+        ]));
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        let rendered = fmt().render(&request).unwrap();
+
+        assert!(rendered.contains("\"description\":\"\""), "{rendered}");
     }
 
     #[test]

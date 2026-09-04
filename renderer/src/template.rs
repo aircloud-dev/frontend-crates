@@ -51,10 +51,14 @@ pub fn deepseek_formatter_for(
 /// If the model is Kimi K3, return its native XTML formatter. K3 ships no
 /// Jinja chat template and must preserve special-vs-ordinary segment boundaries
 /// until tokenization.
+///
+/// Takes no `exclude_tools_when_tool_choice_none`: K3 always renders the
+/// tool-declare block and states `tool_choice=none` in an internal system
+/// message instead, so there is nothing for that switch to select. See
+/// [`crate::kimi_k3::KimiK3Formatter`]'s `build_segments`.
 pub fn kimi_k3_formatter_for(
     model_type_lower: &Option<String>,
     display_name_lower: &str,
-    exclude_tools_when_tool_choice_none: bool,
 ) -> Option<PromptFormatter> {
     if !is_kimi_k3(model_type_lower, display_name_lower) {
         return None;
@@ -66,7 +70,7 @@ pub fn kimi_k3_formatter_for(
         "Detected Kimi K3 model, using native Rust XTML formatter",
     );
     Some(PromptFormatter::OAI(Arc::new(
-        super::kimi_k3::KimiK3Formatter::new(exclude_tools_when_tool_choice_none),
+        super::kimi_k3::KimiK3Formatter::new(),
     )))
 }
 
