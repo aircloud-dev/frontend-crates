@@ -63,13 +63,15 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
         map.insert("nemotron_deci", ReasoningParserType::NemotronDeci);
         map.insert("kimi", ReasoningParserType::Kimi);
         map.insert("kimi_k25", ReasoningParserType::KimiK25);
-        // Kimi K3 uses XTML channel markers. The model opens its own channel:
-        // K3's generation prompt stops at
-        // `<|open|>message role="assistant"<|sep|>` and the completion starts
-        // `<|open|>think<|sep|>`, which is why this parser is built with
-        // `force_reasoning = false` and scans for that literal. Do NOT pair it
-        // with `set_in_reasoning(true)` — that is for prompts which prefill the
-        // opener, and it would strand the marker inside the reasoning text.
+        // Kimi K3 uses XTML channel markers. Its generation prompt prefills the
+        // opener (`<|open|>think<|sep|>`), so the completion begins *inside* the
+        // think channel and carries no opener of its own: it runs to
+        // `<|close|>think<|sep|>` and then opens `<|open|>response<|sep|>`.
+        // `with_dangling_end_recovery()` is what reads that shape — a close
+        // marker with no preceding opener retroactively marks the text before it
+        // as reasoning — so the split holds whether or not a caller also sets
+        // `set_in_reasoning(true)`. `force_reasoning` stays false so a
+        // completion that does carry its own opener still parses.
         map.insert("kimi_k3", ReasoningParserType::KimiK3);
         map.insert("kimi-k3", ReasoningParserType::KimiK3);
         map.insert("step3", ReasoningParserType::Step3);
@@ -1211,6 +1213,46 @@ mod tests {
 
         assert_eq!(result.reasoning_text, "check weather");
         assert_eq!(result.normal_text, "<|open|>response<|sep|>It is raining.");
+    }
+
+    /// A verbatim completion from the deployed K3 checkpoint, captured through
+    /// `/v1/completions` with the renderer's generation prompt (which prefills
+    /// `<|open|>think<|sep|>`). It carries no opener of its own, which is the
+    /// shape `with_dangling_end_recovery()` exists for. Pinned because dropping
+    /// the prefill from the prompt makes the model skip the think channel
+    /// entirely — reasoning then runs inline in `response` and no parser can
+    /// recover it. See `kimi_k3::build_chat_segments` in `dynamo-renderer`.
+    #[test]
+    fn test_kimi_k3_live_prefilled_completion_splits_without_forced_state() {
+        const LIVE: &str = concat!(
+            "17 × 23 = 17 × 20 + 17 × 3 = 340 + 51 = 391",
+            "<|close|>think<|sep|>",
+            "<|open|>response<|sep|>**17 × 23 = 391**<|close|>response<|sep|>",
+            "<|close|>message<|sep|>"
+        );
+
+        // The production path: nothing tells the parser it began in reasoning.
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        let recovered = parser.detect_and_parse_reasoning(LIVE, &[]);
+
+        // And the belt-and-braces path, for a caller that does set it.
+        let mut forced = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        forced.set_in_reasoning(true);
+        let forced = forced.detect_and_parse_reasoning(LIVE, &[]);
+
+        for result in [&recovered, &forced] {
+            assert_eq!(
+                result.reasoning_text,
+                "17 × 23 = 17 × 20 + 17 × 3 = 340 + 51 = 391"
+            );
+            assert!(
+                !result.normal_text.contains("<|close|>think<|sep|>"),
+                "the think closer must not leak into content: {}",
+                result.normal_text
+            );
+            assert!(result.normal_text.contains("**17 × 23 = 391**"));
+        }
+        assert_eq!(recovered.normal_text, forced.normal_text);
     }
 
     #[test]

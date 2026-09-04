@@ -937,37 +937,63 @@ fn build_chat_segments(
     if let Some(partial) = partial_tail {
         render_partial_assistant_segments(&mut segments, partial, thinking)?;
     } else if add_generation_prompt {
-        // The generation prompt stops at the open assistant turn. The channel
-        // opener (`<|open|>think<|sep|>` / `<|open|>response<|sep|>`) is the
-        // model's first three tokens, not the prompt's last three.
+        // The generation prompt prefills the channel opener
+        // (`<|open|>think<|sep|>` / `<|open|>response<|sep|>`), exactly as the
+        // checkpoint's `encoding_k3.py` does with
+        // `_open_tag("think" if thinking else "response")`.
         //
-        // The checkpoint's `encoding_k3.py` does append
-        // `_open_tag("think" if thinking else "response")` here, but Moonshot's
-        // hosted K3 does not, and the hosted API is what the prompt-token
-        // groundtruth measures. Prefilling it puts every prompt exactly 3
-        // tokens over: `<|open|>`, `think`/`response` and `<|sep|>` are one
-        // token each in both modes, which is why the offset was constant. All
-        // 44 vendored `prompt_token_cases` land on their exact
-        // `expected_prompt_tokens` without the opener and 3 over it with —
-        // including the two that pin an exact count (`k3_single_turn_think_off`
-        // = 36, `k3_single_turn_think_on` = 103).
+        // This is load-bearing on the served weights, not decoration. Probing
+        // the deployed checkpoint through `/v1/completions` with a prompt that
+        // stops at `<|open|>message role="assistant"<|sep|>`:
         //
-        // The parsers already read model output that opens its own channel:
-        // the K3 reasoning parser is built with `force_reasoning = false` and
-        // scans for a literal `<|open|>think<|sep|>`, and the XTML tool parser's
-        // grammar starts at `<|open|>response<|sep|>`. Consumers that used to
-        // compensate for the prefill (Dynamo's `starts_in_reasoning` structural
-        // -tag flag, `ReasoningParser::set_in_reasoning(true)`) must now leave
-        // it false — which is what every in-repo construction already does.
+        // * thinking on — the model opens `<|open|>response<|sep|>` as its very
+        //   first tokens and answers. It never opens a think channel, so there
+        //   is no reasoning trace for the parser to separate: the API returns
+        //   `reasoning_content: null` and `reasoning_tokens: 0` however well the
+        //   parser is written. The thinking-effort system message does not
+        //   rescue it — the model reasons inline in the response channel.
+        // * thinking off — worse, the model drifts into a hallucinated tools
+        //   channel, opening `<|open|>tools<|sep|><|open|>call tool="thinking"`
+        //   before recovering into a response, which surfaces as a phantom tool
+        //   call.
         //
-        // Kimi Partial Mode is the one case that still prefills a channel, and
-        // for a different reason: its `response` channel has to be open for the
-        // assistant prefix to sit inside it. See
-        // [`render_partial_assistant_segments`].
+        // With the opener prefilled, both modes are well-formed: thinking on
+        // emits `…reasoning…<|close|>think<|sep|><|open|>response<|sep|>…`, and
+        // thinking off emits a clean `…<|close|>response<|sep|>`.
+        //
+        // The opener costs 3 tokens (`<|open|>`, `think`/`response` and
+        // `<|sep|>` are one token each in both modes, so the offset is a flat
+        // +3 on every prompt). That is inside the vendored groundtruth's own
+        // window: the verifier accepts `expected <= actual <= expected + 3`
+        // (`MAX_PROMPT_TOKEN_OVERCOUNT`), a tolerance that exists precisely
+        // because implementations differ on whether the generation prompt
+        // carries the opener. All 44 `prompt_token_cases` sit at `expected + 3`
+        // with it and `expected` without, so every one of them passes either
+        // way. Undercounting is what the verifier refuses outright, and the two
+        // cases that used to be genuinely wrong — `k3_tool_none` (94 under) and
+        // `k3_tool_choice_allowed_tools` (6 over) — are fixed above by keeping
+        // the tool-declare block under `tool_choice=none` and by dropping
+        // synthetic empty descriptions. Those two fixes are what leave room for
+        // this +3: without them those cases land at 136 (under) and 231 (over
+        // the 225 ceiling).
+        //
+        // Because the opener is in the prompt, the completion begins *inside*
+        // the think channel and carries no `<|open|>think<|sep|>` of its own.
+        // The K3 reasoning parser reads that shape through
+        // `with_dangling_end_recovery()`: a `<|close|>think<|sep|>` with no
+        // preceding opener retroactively marks the text before it as reasoning.
+        // That works without `set_in_reasoning(true)`, so callers need not set
+        // it — and must not, or the recovery and the forced state would both
+        // claim the same prefix.
         open_tag(
             &mut segments,
             "message",
             [("role".to_string(), "assistant".to_string())],
+        );
+        open_tag(
+            &mut segments,
+            if thinking { "think" } else { "response" },
+            [],
         );
     }
 
@@ -1142,22 +1168,25 @@ mod tests {
             concat!(
                 "<|open|>message role=\"user\"<|sep|>Hello",
                 "<|close|>message<|sep|><|end_of_msg|>",
-                "<|open|>message role=\"assistant\"<|sep|>"
+                "<|open|>message role=\"assistant\"<|sep|>",
+                "<|open|>response<|sep|>"
             ),
-            "the generation prompt ends at the open assistant turn; the model \
-             opens its own channel"
+            "thinking off opens the response channel for the model, the way \
+             `encoding_k3.py` does"
         );
     }
 
     /// `k3_single_turn_think_off` from Moonshot's `prompt_token_cases`,
     /// byte-for-byte, pinned as a rendered string.
     ///
-    /// That case pins an exact `usage.prompt_tokens` of **36**. Encoded with
-    /// the K3 tiktoken vocabulary segment-by-segment (`<|open|>`, `<|sep|>`,
+    /// The case's `expected_prompt_tokens` is **36**, accepted over the
+    /// verifier's `expected <= actual <= expected + 3` window. Encoded with the
+    /// K3 tiktoken vocabulary segment-by-segment (`<|open|>`, `<|sep|>`,
     /// `<|close|>` and `<|end_of_msg|>` as their special IDs, everything else
-    /// ordinary), this exact string is 36 tokens. With a trailing
-    /// `<|open|>response<|sep|>` it is 39 — the three tokens this renderer used
-    /// to prefill.
+    /// ordinary), the string below is 39 — 36 plus the three tokens of the
+    /// channel opener, at the top of the window. The opener stays because the
+    /// served checkpoint does not open its own channel without it; see
+    /// `build_chat_segments`.
     #[test]
     fn think_off_generation_prompt_matches_vendored_groundtruth() {
         let mut request = Request::new(json!([
@@ -1175,17 +1204,18 @@ mod tests {
                 "<|close|>message<|sep|><|end_of_msg|>",
                 "<|open|>message role=\"user\"<|sep|>你好",
                 "<|close|>message<|sep|><|end_of_msg|>",
-                "<|open|>message role=\"assistant\"<|sep|>"
+                "<|open|>message role=\"assistant\"<|sep|>",
+                "<|open|>response<|sep|>"
             )
         );
     }
 
     /// `k3_single_turn_think_on`: the same messages at `thinking_effort=max`,
-    /// pinning an exact `usage.prompt_tokens` of **103** (36 + the 67-token
-    /// thinking-effort message). The generation prompt is the same either way —
-    /// the channel opener is the model's, not the prompt's, in both modes,
-    /// which is why the old overcount was a constant 3 rather than mode-
-    /// dependent.
+    /// `expected_prompt_tokens` **103** (36 + the 67-token thinking-effort
+    /// message), rendered at 106 with the opener — again the top of the +3
+    /// window. Only the channel name differs between the modes, and `think` and
+    /// `response` are both one token, which is why the offset is a flat 3
+    /// rather than mode-dependent.
     #[test]
     fn think_on_generation_prompt_matches_vendored_groundtruth() {
         let request = Request::new(json!([
@@ -1206,7 +1236,8 @@ mod tests {
                 "<|close|>message<|sep|><|end_of_msg|>",
                 "<|open|>message role=\"user\"<|sep|>你好",
                 "<|close|>message<|sep|><|end_of_msg|>",
-                "<|open|>message role=\"assistant\"<|sep|>"
+                "<|open|>message role=\"assistant\"<|sep|>",
+                "<|open|>think<|sep|>"
             )
         );
     }
@@ -1529,7 +1560,7 @@ mod tests {
         ));
         assert!(rendered.ends_with(concat!(
             "<|close|>message<|sep|><|end_of_msg|>",
-            "<|open|>message role=\"assistant\"<|sep|>"
+            "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
         )));
     }
 
@@ -1626,12 +1657,12 @@ mod tests {
         assert!(rendered.contains("The system is invoked with `tool_choice=specified`."));
         assert!(rendered.contains("MUST call the tool `add_numbers`"));
         assert!(
-            rendered.ends_with("<|open|>message role=\"assistant\"<|sep|>"),
-            "the generation prompt still ends at the open assistant turn"
+            rendered.ends_with("<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"),
+            "named tool choice must use K3's non-thinking generation prefix"
         );
-        // The generation prompt no longer names the channel, so non-thinking
-        // mode shows up in what is *absent*: no thinking-effort instruction,
-        // and no think channel on the historical assistant turn.
+        // The opener above already names the channel; these pin the rest of
+        // non-thinking mode: no thinking-effort instruction, and no think
+        // channel on the historical assistant turn either.
         assert!(
             !rendered.contains("thinking-effort"),
             "named tool choice must override thinking=true"
@@ -1723,7 +1754,7 @@ mod tests {
         );
         assert!(rendered.ends_with(concat!(
             "<|close|>message<|sep|><|end_of_msg|>",
-            "<|open|>message role=\"assistant\"<|sep|>"
+            "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
         )));
     }
 
