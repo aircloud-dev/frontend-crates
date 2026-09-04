@@ -15,7 +15,7 @@
 use serde_json::{Value, json};
 
 use super::builder::{
-    ToolCallFormatBuildContext, resolve_tools_to_include, uses_declared_tool_schema,
+    ToolCallFormatBuildContext, kimi_uses_declared_tool_schema, resolve_tools_to_include,
 };
 use super::format::{
     ConstStringFormat, Format, JsonSchemaFormat, JsonSchemaStyle, RegexFormat, SequenceFormat,
@@ -33,7 +33,7 @@ fn tool_schema(tool: &ToolDefinition, strict_schema: bool) -> Value {
     // Match vLLM/xgrammar: use the declared parameters unless the request
     // explicitly opts out with strict=false. Global strict mode overrides the
     // opt-out. Xgrammar uses `true` for unconstrained but valid JSON.
-    if uses_declared_tool_schema(tool, strict_schema) {
+    if kimi_uses_declared_tool_schema(tool, strict_schema) {
         tool.parameters.clone().unwrap_or_else(|| json!(true))
     } else {
         json!(true)

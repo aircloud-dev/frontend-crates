@@ -21,13 +21,13 @@ use super::triggered_tags::{self, TriggeredTagsConfig};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuralTagSchemaMode {
-    /// Use the declared schema unless the tool explicitly sets `strict: false`.
-    /// An omitted `strict` field is schema-enforced; explicit `false` uses an
-    /// unconstrained argument schema (`true` in xgrammar).
+    /// Real schema only for tools with `strict: true`; others get an
+    /// unconstrained schema (`true` in xgrammar). This is OpenAI's
+    /// structured-outputs semantics: `strict` is an opt-in, and a tool that
+    /// omits it is not schema-constrained.
     #[default]
     Auto,
-    /// Use the declared parameter schema for all tools, overriding
-    /// `strict: false`.
+    /// Real parameter schema for all tools regardless of `strict` flag.
     Strict,
 }
 
@@ -84,25 +84,38 @@ pub(crate) fn resolve_tools_to_include<'a>(
     }
 }
 
-/// Whether a tool's declared parameter schema should constrain its arguments.
-///
-/// [`StructuralTagSchemaMode::Auto`] treats an omitted `strict` field as
-/// schema-enforced. Only an explicit `strict: false` opts out. Global strict
-/// mode overrides that per-tool opt-out.
-pub(crate) fn uses_declared_tool_schema(tool: &ToolDefinition, strict_schema: bool) -> bool {
-    strict_schema || tool.strict != Some(false)
-}
-
 /// Resolve one tool's argument schema using Dynamo's generic schema policy.
+///
+/// In [`StructuralTagSchemaMode::Auto`], only `strict: true` selects the
+/// declared schema. Model-native builders may intentionally follow different
+/// upstream semantics and should use a model-specific policy helper — see
+/// [`kimi_uses_declared_tool_schema`]. Do not route the generic builders
+/// through a model's policy: the tools reaching this function belong to
+/// families (hermes, qwen25, qwen3_coder, inkling, deepseek_dsml) whose clients
+/// mostly never send `strict` at all, and constraining their arguments to a
+/// declared schema that is often incomplete changes output that previously
+/// decoded freely.
 pub(crate) fn resolve_tool_schema(tool: &ToolDefinition, strict_schema: bool) -> Value {
     // xgrammar uses `true` for syntactically valid but schema-unconstrained JSON.
     let default_schema = json!(true);
 
-    if uses_declared_tool_schema(tool, strict_schema) {
+    let use_tool_schema = strict_schema || tool.strict.unwrap_or(false);
+    if use_tool_schema {
         tool.parameters.clone().unwrap_or(default_schema)
     } else {
         default_schema
     }
+}
+
+/// Whether Kimi's vLLM/xgrammar-compatible format should use the declared
+/// parameter schema.
+///
+/// Kimi treats only an explicit `strict: false` as an opt-out. An omitted
+/// `strict` value therefore uses the declared schema, unlike Dynamo's generic
+/// [`StructuralTagSchemaMode::Auto`] policy. Scoped to the Kimi builders on
+/// purpose.
+pub(crate) fn kimi_uses_declared_tool_schema(tool: &ToolDefinition, strict_schema: bool) -> bool {
+    strict_schema || tool.strict != Some(false)
 }
 
 /// Builder for model-family-specific tool-call structural tags.

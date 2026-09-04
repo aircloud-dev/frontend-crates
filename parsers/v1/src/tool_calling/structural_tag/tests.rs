@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use super::TOOL_NAME_PLACEHOLDER;
 use super::builder::{
     StructuralTagBuilder, StructuralTagSchemaMode, ToolCallFormatBuildContext,
-    uses_declared_tool_schema,
+    kimi_uses_declared_tool_schema,
 };
 use super::dsml::DsmlToolCallsConfig;
 use super::format::JsonSchemaStyle;
@@ -244,7 +244,7 @@ fn parallel_true_does_not_stop_after_first() {
 }
 
 #[test]
-fn omitted_strict_uses_declared_schema() {
+fn non_strict_tools_get_unconstrained_schema() {
     let tools = sample_tools();
     let parsed = build_unwrap(
         &builder(),
@@ -255,14 +255,58 @@ fn omitted_strict_uses_declared_schema() {
     );
 
     let tags = parsed["format"]["tags"].as_array().unwrap();
-    assert!(tags[0]["content"]["json_schema"]["properties"]["a"].is_object());
-    assert!(tags[1]["content"]["json_schema"]["properties"]["location"].is_object());
+    assert_eq!(tags[0]["content"]["json_schema"], json!(true));
+}
+
+/// `strict` is an OpenAI opt-in: absent means *not* strict. The generic
+/// builders serve hermes / qwen25 / qwen3_coder / inkling / deepseek_dsml,
+/// whose clients overwhelmingly omit the field, so an omitted `strict` must
+/// leave arguments unconstrained on every one of them.
+#[test]
+fn omitted_strict_leaves_generic_builder_arguments_unconstrained() {
+    let mut tools = sample_tools();
+    assert_eq!(tools[0].strict, None, "fixture must omit strict");
+    assert_eq!(tools[1].strict, None, "fixture must omit strict");
+
+    let triggered = build_unwrap(
+        &builder(),
+        &ToolChoice::Required,
+        &tools,
+        None,
+        StructuralTagSchemaMode::Auto,
+    );
+    let tags = triggered["format"]["tags"].as_array().unwrap();
+    assert_eq!(tags[0]["content"]["json_schema"], json!(true));
+    assert_eq!(tags[1]["content"]["json_schema"], json!(true));
+
+    let dsml = dsml_build_unwrap(
+        &ToolChoice::Required,
+        &tools,
+        None,
+        StructuralTagSchemaMode::Auto,
+    );
+    let invokes = dsml["format"]["tags"][0]["content"]["tags"]
+        .as_array()
+        .unwrap();
+    assert_eq!(invokes[0]["content"]["json_schema"], json!(true));
+    assert_eq!(invokes[1]["content"]["json_schema"], json!(true));
+
+    // Only an explicit opt-in reaches the declared schema.
+    tools[0].strict = Some(true);
+    let opted_in = build_unwrap(
+        &builder(),
+        &ToolChoice::Required,
+        &tools,
+        None,
+        StructuralTagSchemaMode::Auto,
+    );
+    assert!(opted_in["format"]["tags"][0]["content"]["json_schema"]["properties"]["a"].is_object());
 }
 
 #[test]
-fn explicit_strict_false_uses_unconstrained_schema() {
+fn strict_tool_uses_own_schema() {
     let mut tools = sample_tools();
-    tools[0].strict = Some(false);
+    tools[0].strict = Some(true);
     let parsed = build_unwrap(
         &builder(),
         &ToolChoice::Required,
@@ -272,8 +316,8 @@ fn explicit_strict_false_uses_unconstrained_schema() {
     );
 
     let tags = parsed["format"]["tags"].as_array().unwrap();
-    assert_eq!(tags[0]["content"]["json_schema"], json!(true));
-    assert!(tags[1]["content"]["json_schema"]["properties"]["location"].is_object());
+    assert!(tags[0]["content"]["json_schema"]["properties"]["a"].is_object());
+    assert_eq!(tags[1]["content"]["json_schema"], json!(true));
 }
 
 #[test]
@@ -293,19 +337,21 @@ fn strict_schema_mode_uses_real_schema_for_all() {
     assert!(tags[1]["content"]["json_schema"]["properties"]["location"].is_object());
 }
 
+/// Kimi's policy differs from the generic one on purpose, and stays scoped to
+/// the Kimi builders.
 #[test]
-fn schema_policy_treats_only_explicit_false_as_opt_out() {
+fn kimi_schema_policy_matches_vllm_xgrammar() {
     let mut tool = sample_tools().remove(0);
 
     tool.strict = None;
-    assert!(uses_declared_tool_schema(&tool, false));
+    assert!(kimi_uses_declared_tool_schema(&tool, false));
 
     tool.strict = Some(true);
-    assert!(uses_declared_tool_schema(&tool, false));
+    assert!(kimi_uses_declared_tool_schema(&tool, false));
 
     tool.strict = Some(false);
-    assert!(!uses_declared_tool_schema(&tool, false));
-    assert!(uses_declared_tool_schema(&tool, true));
+    assert!(!kimi_uses_declared_tool_schema(&tool, false));
+    assert!(kimi_uses_declared_tool_schema(&tool, true));
 }
 
 #[test]
