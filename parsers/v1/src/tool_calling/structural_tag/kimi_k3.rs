@@ -497,7 +497,7 @@ fn canonical_required_arguments(
 }
 
 fn auto_arguments_block(tool: &ToolDefinition, strict_schema: bool) -> Format {
-    if !super::builder::uses_declared_tool_schema(tool, strict_schema) {
+    if !super::builder::kimi_uses_declared_tool_schema(tool, strict_schema) {
         return arguments_block(None);
     }
 
@@ -619,7 +619,7 @@ fn build_auto_structural_tag(
 fn call_tag(tool: &ToolDefinition, strict_schema: bool) -> TagFormat {
     // Match vLLM's K3 behavior: use the declared schema unless the caller
     // explicitly sets strict=false. Global strict mode overrides that opt-out.
-    let parameters = if super::builder::uses_declared_tool_schema(tool, strict_schema) {
+    let parameters = if super::builder::kimi_uses_declared_tool_schema(tool, strict_schema) {
         tool.parameters.as_ref()
     } else {
         None
