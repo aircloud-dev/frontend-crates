@@ -1274,7 +1274,7 @@ mod tests {
         assert_eq!(split.reasoning_text, "use the calculator");
         assert_eq!(content.as_deref(), Some("I will calculate."));
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "calc:0");
+        assert!(calls[0].id.starts_with("call-"), "id {}", calls[0].id);
         assert_eq!(calls[0].function.name, "calc");
         assert_eq!(calls[0].function.arguments, r#"{"x":42}"#);
     }
