@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::super::ToolDefinition;
 use super::super::config::KimiK3ParserConfig;
@@ -396,7 +397,10 @@ fn parse_call_at(
         return Some((None, consumed));
     }
 
-    let id = tool_call_id(name, attr_value(&attrs, "index"));
+    // Mint a fresh uuid like every other parser in this crate. See the
+    // `ids_are_unique_across_invocations` regression test for why the model's
+    // own `index` attribute must not seed the id.
+    let id = format!("call-{}", Uuid::new_v4());
     Some((
         Some(ToolCallResponse {
             id,
@@ -547,16 +551,6 @@ fn attr_value<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn tool_call_id(name: &str, index: Option<&str>) -> String {
-    match index.filter(|index| !index.is_empty()) {
-        None => name.to_string(),
-        Some(raw) => match raw.parse::<i64>() {
-            Ok(one_based) => format!("{name}:{}", one_based - 1),
-            Err(_) => format!("{name}:{raw}"),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
@@ -584,6 +578,13 @@ mod tests {
         (calls, normal.unwrap())
     }
 
+    /// A minted id: the crate-wide `call-<uuid>` shape, carrying nothing derived
+    /// from the model's own output.
+    fn is_minted_id(id: &str) -> bool {
+        id.strip_prefix("call-")
+            .is_some_and(|rest| Uuid::parse_str(rest).is_ok())
+    }
+
     #[test]
     fn parses_response_and_all_typed_arguments() {
         let body = [
@@ -604,7 +605,7 @@ mod tests {
 
         assert_eq!(normal, "I'll check.");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].id, "get_weather:0");
+        assert!(is_minted_id(&calls[0].id), "id {}", calls[0].id);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(
             calls[0].function.arguments,
@@ -618,7 +619,7 @@ mod tests {
         let json = format!("{JSON_OPEN_PREFIX} type=\"object\"{SEP}{raw}{JSON_CLOSE}");
         let (calls, _) = parse(&tools(&call("tool=\"run\" index=\"2\"", &json)));
 
-        assert_eq!(calls[0].id, "run:1");
+        assert!(is_minted_id(&calls[0].id), "id {}", calls[0].id);
         assert_eq!(calls[0].function.arguments, raw);
     }
 
@@ -660,9 +661,12 @@ mod tests {
         let (calls, _) = parse(&input);
 
         assert_eq!(calls.len(), 3);
-        assert_eq!(calls[0].id, "first:2");
-        assert_eq!(calls[1].id, "second:raw");
-        assert_eq!(calls[2].id, "third");
+        for called in &calls {
+            assert!(is_minted_id(&called.id), "id {}", called.id);
+        }
+        let ids: std::collections::HashSet<&str> =
+            calls.iter().map(|called| called.id.as_str()).collect();
+        assert_eq!(ids.len(), calls.len(), "ids repeat within one response");
     }
 
     #[test]
@@ -768,6 +772,31 @@ mod tests {
         assert_eq!(
             find_tool_call_end_position_kimi_k3(TOOLS_OPEN, &config),
             None
+        );
+    }
+
+    /// Regression test: the K3 parser must produce ids that are unique not just
+    /// within one invocation but across invocations. `jail/mod.rs` slices the raw
+    /// stream at each XTML boundary and invokes the parser once per span, and the
+    /// model's own `index` attribute restarts at 1 in every assistant turn. An id
+    /// derived from that attribute repeats, and a repeated id is what clients pair
+    /// the wrong tool result to; Dynamo's E2E harness rejects it as
+    /// `duplicate_tool_ids`. `harmony_parser.rs` carries the same test for the same
+    /// reason.
+    #[test]
+    fn ids_are_unique_across_invocations() {
+        let first = tools(&call("tool=\"get_weather\" index=\"1\"", ""));
+        let second = tools(&call("tool=\"get_weather\" index=\"1\"", ""));
+
+        let (calls_a, _) = parse(&first);
+        let (calls_b, _) = parse(&second);
+
+        assert_eq!(calls_a.len(), 1);
+        assert_eq!(calls_b.len(), 1);
+        assert!(is_minted_id(&calls_a[0].id), "id {}", calls_a[0].id);
+        assert_ne!(
+            calls_a[0].id, calls_b[0].id,
+            "two invocations of the same call must not share an id"
         );
     }
 }
