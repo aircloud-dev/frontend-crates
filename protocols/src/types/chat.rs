@@ -705,12 +705,18 @@ pub struct ChatCompletionRequestSystemMessage {
     /// keys serde doesn't know about on round-trip, whereas `serde_json::Value`
     /// is byte-for-byte faithful.
     ///
-    /// Kimi's `encoding_k3.py` renders this through the same tool-declare path
-    /// as the top-level `tools` field and never inspects individual entries, so
-    /// the canonical shape is the same OpenAI wrapped form,
-    /// `{"type": "function", "function": {...}}`. Clients that send bare
+    /// The canonical shape is the same OpenAI wrapped form as the top-level
+    /// `tools` field, `{"type": "function", "function": {...}}`: that is what
+    /// every dynamic-tools case in K3's own prompt-token groundtruth sends, and
+    /// the renderer never inspects individual entries. Clients that send bare
     /// function-schema objects (`{"name": ..., "parameters": ...}`) are passed
     /// through unchanged as well; this crate takes no position on the shape.
+    ///
+    /// The *shape* being shared does not make the rendering shared. K3 declares
+    /// message-level tools under a distinct "new tools available / lazy-loading"
+    /// framing, not the "# Tools" preamble the top-level `tools` field gets, so
+    /// the two are not interchangeable in the prompt and their token counts
+    /// differ. See `dynamo_renderer::kimi_k3`'s `render_tool_declare`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<serde_json::Value>,
 }

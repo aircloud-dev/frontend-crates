@@ -319,6 +319,18 @@ fn render_content_segments(
     Ok(())
 }
 
+/// Whether a message's `content` would put anything at all into the prompt.
+///
+/// Rendered rather than pattern-matched so the answer is exactly "does this
+/// content reach the prompt": `push_segment` already drops empty strings, so an
+/// absent, null, `""` or `[]` content produces no segments, while text parts and
+/// image placeholders produce some.
+fn content_is_empty(content: Option<&Value>) -> Result<bool> {
+    let mut probe = Vec::new();
+    render_content_segments(&mut probe, content)?;
+    Ok(probe.is_empty())
+}
+
 fn render_role_message(
     segments: &mut Vec<RenderedSegment>,
     message: &Value,
@@ -744,20 +756,38 @@ fn build_chat_segments(
             PromptRenderError::invalid_request("Kimi K3 messages must contain a string role")
         })?;
         match role {
+            // A dynamic tool declaration owns its whole message: Kimi's K3 API
+            // accepts `tools` on a system message only when that message has no
+            // content of its own, and refuses the combined shape outright rather
+            // than rendering both. Every dynamic-tools case in the vendored
+            // groundtruth (`k3_tool_dynamic_tools`, `k3_tool_dynamic_midway`,
+            // `k3_tool_dynamic_tools_not_in_top_level`) declares tools on a
+            // message with no `content` key, every dynamic-tools request the
+            // vendor accepts sends `"content": ""`, and
+            // `test_content_and_dynamic_tools_nonempty_rejected` pins
+            // `{"role": "system", "content": "not empty", "tools": [...]}` to a
+            // 400. There is therefore no reference byte order for "content plus
+            // tools" to reproduce; refuse it, so the content cannot go missing
+            // from the prompt without anyone noticing.
+            //
+            // `developer` is folded in rather than special-cased: K3 renders
+            // developer turns as `system`, and `tools` cannot actually survive
+            // deserialization on a developer message anyway (upstream's
+            // `ChatCompletionRequestDeveloperMessage` has no such field), so a
+            // separate branch for it would only be unreachable code.
             "system" | "developer"
                 if message.get("tools").is_some_and(|tools| {
                     !tools.is_null() && !tools.as_array().is_some_and(Vec::is_empty)
                 }) =>
             {
+                if !content_is_empty(message.get("content"))? {
+                    return Err(PromptRenderError::invalid_request(
+                        "Kimi K3 messages declaring `tools` must not also carry content",
+                    )
+                    .into());
+                }
                 let dynamic_tools = deep_sort(message["tools"].clone());
                 render_tool_declare(&mut segments, &dynamic_tools, true)?;
-                if role == "developer"
-                    && message
-                        .get("content")
-                        .is_some_and(|content| !content.is_null())
-                {
-                    render_role_message(&mut segments, message, "system")?;
-                }
             }
             "user" | "system" | "developer" => {
                 let rendered_role = if role == "developer" { "system" } else { role };
@@ -1084,9 +1114,50 @@ mod tests {
         );
     }
 
+    // -- Dynamic tools declared on a system message --
+
+    /// The tool the conformance board declares on a system message.
+    fn weather_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather of a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })
+    }
+
     #[test]
-    fn renders_developer_tools_and_content() {
-        let mut request = Request::new(json!([
+    fn refuses_system_tools_alongside_content() {
+        // `dynamic_tools.nonempty_content_rejected` / the vendor's
+        // `test_content_and_dynamic_tools_nonempty_rejected`, verbatim. Before,
+        // this rendered happily and dropped "not empty" on the floor.
+        let request = Request::new(json!([
+            {"role": "system", "content": "not empty", "tools": [weather_tool()]},
+            {"role": "user", "content": "hello"}
+        ]));
+
+        let error = fmt().render(&request).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<PromptRenderError>(),
+            Some(PromptRenderError::InvalidRequest(message))
+                if message == "Kimi K3 messages declaring `tools` must not also carry content"
+        ));
+    }
+
+    #[test]
+    fn refuses_developer_tools_alongside_content() {
+        // K3 renders developer turns as system turns, so the same rule applies.
+        // This replaces the old `renders_developer_tools_and_content`, which
+        // asserted that the pair rendered both — a shape the vendor refuses,
+        // and one `tools` cannot reach the renderer in anyway.
+        let request = Request::new(json!([
             {
                 "role": "developer",
                 "content": "Use the newly available tool",
@@ -1097,16 +1168,66 @@ mod tests {
             },
             {"role": "user", "content": "Look this up"}
         ]));
-        request
-            .args
-            .insert("thinking".to_string(), Value::Bool(false));
 
-        let rendered = fmt().render(&request).unwrap();
+        let error = fmt().render(&request).unwrap_err();
 
-        assert!(rendered.contains("## New Tools Available"));
-        assert!(
-            rendered.contains("<|open|>message role=\"system\"<|sep|>Use the newly available tool")
-        );
+        assert!(matches!(
+            error.downcast_ref::<PromptRenderError>(),
+            Some(PromptRenderError::InvalidRequest(message))
+                if message == "Kimi K3 messages declaring `tools` must not also carry content"
+        ));
+    }
+
+    #[test]
+    fn refuses_system_tools_alongside_multimodal_content_parts() {
+        // Content need not be a bare string to go missing: an array of parts
+        // was dropped by exactly the same path.
+        for content in [
+            json!([{"type": "text", "text": "keep me"}]),
+            json!([{"type": "image_url", "image_url": {"url": "http://example/x.png"}}]),
+        ] {
+            let request = Request::new(json!([
+                {"role": "system", "content": content, "tools": [weather_tool()]},
+                {"role": "user", "content": "hello"}
+            ]));
+
+            let error = fmt().render(&request).unwrap_err();
+
+            assert!(
+                matches!(
+                    error.downcast_ref::<PromptRenderError>(),
+                    Some(PromptRenderError::InvalidRequest(message))
+                        if message
+                            == "Kimi K3 messages declaring `tools` must not also carry content"
+                ),
+                "non-empty part arrays must be refused, not silently dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_content_alongside_tools_declares_tools_and_nothing_else() {
+        // The shape every accepted dynamic-tools request uses: `"content": ""`.
+        // A declaration message must contribute the tool-declare block alone —
+        // an extra empty `system` turn would be pure prompt-token overcount.
+        for role in ["system", "developer"] {
+            let mut request = Request::new(json!([
+                {"role": role, "content": "", "tools": [weather_tool()]},
+                {"role": "user", "content": "what is the weather in beijing?"}
+            ]));
+            request
+                .args
+                .insert("thinking".to_string(), Value::Bool(false));
+
+            let rendered = fmt().render(&request).unwrap();
+
+            assert!(rendered.contains("## New Tools Available"), "{role}");
+            assert_eq!(
+                rendered.matches("<|open|>message role=\"system\"").count(),
+                1,
+                "{role}: only the tool-declare turn may be emitted, got {rendered}"
+            );
+        }
     }
 
     #[test]
