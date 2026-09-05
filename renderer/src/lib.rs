@@ -122,6 +122,7 @@ impl RenderedSegment {
 pub struct RenderedPrompt {
     text: String,
     segments: Option<Vec<RenderedSegment>>,
+    pending_tokens: u32,
 }
 
 impl RenderedPrompt {
@@ -129,6 +130,7 @@ impl RenderedPrompt {
         Self {
             text,
             segments: None,
+            pending_tokens: 0,
         }
     }
 
@@ -140,7 +142,30 @@ impl RenderedPrompt {
         Self {
             text,
             segments: Some(segments),
+            pending_tokens: 0,
         }
+    }
+
+    /// Declare a trailing run of prompt tokens the API must not report.
+    ///
+    /// These tokens are really in the prompt: they are encoded, they are sent,
+    /// and the engine attends to them. They are simply not the caller's prompt.
+    /// A generation-prompt stub belongs to the completion the model is about to
+    /// write, and the vendor accounts it there — so it is rendered and then
+    /// subtracted from `usage.prompt_tokens`, never dropped from the prompt.
+    ///
+    /// Suffix, not count-anywhere: the stub is the last thing rendered, which is
+    /// what lets a consumer subtract it without knowing which tokens they were.
+    pub fn with_pending_tokens(mut self, pending_tokens: u32) -> Self {
+        self.pending_tokens = pending_tokens;
+        self
+    }
+
+    /// Prompt tokens rendered for the model that the API must not bill.
+    ///
+    /// Zero for every formatter that does not prefill a generation stub.
+    pub fn pending_tokens(&self) -> u32 {
+        self.pending_tokens
     }
 
     pub fn as_str(&self) -> &str {
@@ -206,6 +231,23 @@ pub trait OAIChatLikeRequest {
     fn tools(&self) -> Option<Value> {
         None
     }
+
+    /// Whether this request makes any tool callable at all.
+    ///
+    /// Deliberately separate from [`Self::tools`]. `tools` answers what the
+    /// prompt declares under its global tools preamble; a model such as Kimi K3
+    /// also lets a message declare tools inline, and those are rendered from
+    /// the message itself. Folding them into `tools` would declare them twice
+    /// and change the prompt, so a request that carries them overrides this
+    /// instead. Gates that ask "may a tool be called" — rather than "what does
+    /// the global preamble list" — must ask this.
+    fn has_callable_tools(&self) -> bool {
+        self.tools()
+            .as_ref()
+            .and_then(|tools| tools.len())
+            .is_some_and(|len| len > 0)
+    }
+
     fn tool_choice(&self) -> Option<Value> {
         None
     }

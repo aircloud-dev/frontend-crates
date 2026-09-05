@@ -23,25 +23,55 @@ const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
 const SEP_TOKEN: &str = "<|sep|>";
 const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
-/// The one token this renderer emits per image.
+/// The one marker this renderer emits per image.
 ///
-/// This is the canonical frontend contract: exactly one `<|media_pad|>` per
-/// image, for every engine. It is a registered special token in the K3
-/// tokenizer (`config.json`'s `media_placeholder_token_id`), so it encodes to
-/// a single id and stays one id no matter what surrounds it.
+/// Exactly one `<|kimi_image_placeholder|>` per image, as ordinary (non-special)
+/// text. This is `config.json`'s `image_placeholder`, and it is the string the
+/// worker looks for: vLLM's K3 processor registers a single
+/// `PromptReplacement { target: hf_config.image_placeholder, .. }` and expands
+/// each occurrence, resolution-aware, into
+/// `<|media_begin|>image {w}x{h}<|media_content|>{pads}<|media_end|>`, where
+/// `pads` is `<|media_pad|>` repeated `media_tokens_calculator(..)` times
+/// (`vllm/models/kimi_k3/common/mm_preprocess.py::_get_prompt_updates`, v0.28.0).
+/// The expansion is the worker's job and must not be pre-rendered here: doing so
+/// would leave no target to replace and double-count the media block.
 ///
-/// The checkpoint's other spelling, `<|kimi_image_placeholder|>`, is a plain
-/// string that is *not* in the vocabulary — it BPE-shatters into several ids
-/// whose boundaries depend on neighbouring text. Engines that want that form
-/// (vLLM) convert from the pad on the worker side, where a single known id is
-/// a reliable thing to substitute; matching a shattered string is not.
+/// It is deliberately *not* emitted as a control segment. The placeholder is not
+/// in the vocabulary — `tokenizer_config.json` registers `<|media_pad|>` but not
+/// this — so it BPE-shatters, and matching works only because the worker encodes
+/// the same string the same way. Its own segment keeps that encoding isolated
+/// from neighbouring prose, which is what makes the shattered id run stable;
+/// `push_segment` never merges, so this holds by construction.
 ///
-/// Equivalent to calling the checkpoint's own
-/// `encoding_k3.build_chat_segments(image_prompts=["<|media_pad|>"] * n)` —
-/// `image_prompts` is the model author's hook for exactly this choice, and
-/// `<|kimi_image_placeholder|>` is only its `None` fallback.
-const MEDIA_PAD: &str = "<|media_pad|>";
+/// This renderer emitted `<|media_pad|>` here until hgr6. The pad is a
+/// registered token, so it encoded cleanly and looked right, but it is what the
+/// expansion produces, not what it consumes: the worker found no
+/// `<|kimi_image_placeholder|>` to replace, so no image ever got embedding
+/// slots and every vision request failed. All 11 vendored `k3_vision_*`
+/// prompt-token cases returned HTTP 500 against `…-hgr5`.
+const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 const VALID_THINKING_EFFORTS: &[&str] = &["low", "high", "max"];
+/// Tokens in the prefilled channel opener, which the API must not bill.
+///
+/// The generation prompt ends `<|open|>think<|sep|>` or
+/// `<|open|>response<|sep|>`. All three are single tokens in both modes, so the
+/// stub is a flat three however long the prompt is.
+///
+/// Rendered, not reported. It has to be in the prompt — without it the served
+/// checkpoint never opens a think channel, so `reasoning_content` is always
+/// null, and with thinking off it emits a phantom `thinking` tool call. But it
+/// is the opening of the completion the model is about to write, not part of
+/// what the caller sent, and the vendor accounts it on the completion side:
+/// their groundtruth is `len(golden prompt ids) - 3`, and
+/// `tests/k3_features/test_response_format.py` says outright that
+/// `usage.prompt_tokens` corresponds to tokenism's `total_tokens -
+/// pending_tokens`. Measured across all 44 vendored `prompt_token_cases` the
+/// delta is a flat 3, 44/44, thinking on and off, tools and none, prompts from
+/// 36 to 551 tokens.
+///
+/// Subtracted at the reporting boundary, never from the count the engine is
+/// reconciled against — see the `ResponseState` note in `patch_dynamo.py`.
+const PENDING_OPENER_TOKENS: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct KimiK3Formatter;
@@ -51,7 +81,10 @@ impl KimiK3Formatter {
         Self
     }
 
-    fn build_segments(&self, req: &dyn OAIChatLikeRequest) -> Result<Vec<RenderedSegment>> {
+    /// The segments, plus how many trailing tokens are the generation stub.
+    ///
+    /// See [`PENDING_OPENER_TOKENS`]. Zero whenever no stub was appended.
+    fn build_segments(&self, req: &dyn OAIChatLikeRequest) -> Result<(Vec<RenderedSegment>, u32)> {
         let messages = json_value(req.messages()).context("Failed to convert K3 messages")?;
         let messages = messages
             .as_array()
@@ -116,11 +149,13 @@ impl OAIPromptFormatter for KimiK3Formatter {
     }
 
     fn render(&self, req: &dyn OAIChatLikeRequest) -> Result<String> {
-        Ok(RenderedPrompt::segmented(self.build_segments(req)?).into_text())
+        let (segments, _pending) = self.build_segments(req)?;
+        Ok(RenderedPrompt::segmented(segments).into_text())
     }
 
     fn render_prompt(&self, req: &dyn OAIChatLikeRequest) -> Result<RenderedPrompt> {
-        Ok(RenderedPrompt::segmented(self.build_segments(req)?))
+        let (segments, pending) = self.build_segments(req)?;
+        Ok(RenderedPrompt::segmented(segments).with_pending_tokens(pending))
     }
 }
 
@@ -342,7 +377,7 @@ fn render_content_segments(
         Value::Array(parts) => {
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
-                    Some("image" | "image_url") => control(segments, MEDIA_PAD),
+                    Some("image" | "image_url") => text(segments, IMAGE_PLACEHOLDER),
                     _ => {
                         if let Some(part_text) = part.get("text") {
                             text(segments, value_as_body_text(part_text)?);
@@ -743,7 +778,7 @@ fn build_chat_segments(
     add_generation_prompt: bool,
     thinking: bool,
     thinking_effort: &str,
-) -> Result<Vec<RenderedSegment>> {
+) -> Result<(Vec<RenderedSegment>, u32)> {
     let mut segments = Vec::new();
     let mut previous_tool_calls: Option<&Value> = None;
     let mut tool_index = 0usize;
@@ -934,6 +969,7 @@ fn build_chat_segments(
     // A partial assistant turn *is* the generation prompt: it is left open so
     // the model continues from its prefix, so the generic prompt is skipped
     // regardless of `add_generation_prompt`.
+    let mut pending_tokens = 0;
     if let Some(partial) = partial_tail {
         render_partial_assistant_segments(&mut segments, partial, thinking)?;
     } else if add_generation_prompt {
@@ -995,9 +1031,13 @@ fn build_chat_segments(
             if thinking { "think" } else { "response" },
             [],
         );
+        // Only this channel opener is pending, not the assistant `message` tag
+        // above it: the vendor's groundtruth counts the open turn and subtracts
+        // just the three tokens `open_tag` emits here.
+        pending_tokens = PENDING_OPENER_TOKENS;
     }
 
-    Ok(segments)
+    Ok((segments, pending_tokens))
 }
 
 #[cfg(test)]
@@ -1083,24 +1123,94 @@ mod tests {
             .to_vec()
     }
 
+    /// `<|media_pad|>` is what the worker's expansion *produces*. The renderer
+    /// must never emit it: it is not the replacement target, so a prompt
+    /// carrying it gets no media block at all.
+    const MEDIA_PAD: &str = "<|media_pad|>";
+
+    // -- Pending tokens: the generation stub is rendered but not reported --
+
     #[test]
-    fn renders_one_media_pad_per_image() {
+    fn generation_prompt_declares_three_pending_tokens() {
+        for thinking in [true, false] {
+            let mut request = Request::new(json!([{"role": "user", "content": "hi"}]));
+            request
+                .args
+                .insert("thinking".to_string(), Value::Bool(thinking));
+
+            let prompt = fmt().render_prompt(&request).unwrap();
+
+            assert_eq!(
+                prompt.pending_tokens(),
+                PENDING_OPENER_TOKENS,
+                "thinking={thinking}"
+            );
+            // The count is only subtractable because the stub is a suffix, and
+            // only correct because each of those three segments is one token.
+            let segments = prompt.segments().expect("K3 renders segmented prompts");
+            let tail: Vec<&str> = segments
+                .iter()
+                .rev()
+                .take(3)
+                .map(|segment| segment.text.as_str())
+                .collect();
+            assert_eq!(
+                tail,
+                [SEP_TOKEN, if thinking { "think" } else { "response" }, OPEN_TOKEN],
+                "the pending tokens must be exactly the trailing channel opener"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_assistant_turn_has_no_pending_tokens() {
+        // The partial turn *is* the generation prompt, and every token in it is
+        // caller-supplied prefix, so none of it is a stub to discount.
+        let mut request = Request::new(json!([
+            {"role": "user", "content": "Greet the customer"},
+            {"role": "assistant", "content": "Dear customer, hello", "partial": true}
+        ]));
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        assert_eq!(fmt().render_prompt(&request).unwrap().pending_tokens(), 0);
+    }
+
+    #[test]
+    fn no_generation_prompt_means_no_pending_tokens() {
+        let mut request = Request::new(json!([{"role": "user", "content": "hi"}]));
+        request.add_generation_prompt = false;
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        assert_eq!(fmt().render_prompt(&request).unwrap().pending_tokens(), 0);
+    }
+
+    #[test]
+    fn renders_one_image_placeholder_per_image() {
         let segments = image_segments(&fmt(), &image_request());
 
         let matches: Vec<_> = segments
             .iter()
-            .filter(|segment| segment.text == MEDIA_PAD)
+            .filter(|segment| segment.text == IMAGE_PLACEHOLDER)
             .collect();
-        assert_eq!(matches.len(), 1, "exactly one pad per image");
-        // The pad MUST stay special: it is a registered token, and only the
-        // special-aware encode path yields its single id.
-        assert!(matches[0].allow_special);
-        // The checkpoint's non-vocabulary spelling must never be emitted --
-        // the vLLM worker converts from the pad instead.
+        assert_eq!(matches.len(), 1, "exactly one placeholder per image");
+        // It must NOT be special. The placeholder is absent from the vocabulary,
+        // so it only matches the worker's target when both sides BPE the same
+        // string the same way; the special-aware path does not encode it.
+        assert!(
+            !matches[0].allow_special,
+            "the placeholder is not a registered token and must encode as text"
+        );
+        // The pad is the expansion's output, never the renderer's. Emitting it
+        // instead of the placeholder is what made every vision request 500.
         assert!(
             !segments
                 .iter()
-                .any(|segment| segment.text.contains("kimi_image_placeholder")),
+                .any(|segment| segment.text == MEDIA_PAD),
+            "the renderer must not emit the pad the worker expands into"
         );
     }
 
@@ -1124,7 +1234,7 @@ mod tests {
         assert_eq!(
             segments
                 .iter()
-                .filter(|segment| segment.text == MEDIA_PAD)
+                .filter(|segment| segment.text == IMAGE_PLACEHOLDER)
                 .count(),
             2
         );

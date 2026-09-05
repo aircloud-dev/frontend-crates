@@ -5,6 +5,7 @@
 // extensions on top. Types prefixed with `Dynamo` or entirely absent from the
 // upstream spec are documented with the rationale for the extension.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 
 use derive_builder::Builder;
@@ -906,6 +907,104 @@ pub struct CreateChatCompletionRequest {
     pub web_search_options: Option<WebSearchOptions>,
 }
 
+impl ChatCompletionRequestSystemMessage {
+    /// The tools this message declares inline, in declaration order.
+    ///
+    /// [`Self::tools`] is stored as raw JSON so nothing is lost on round-trip
+    /// to the chat template; this reads it back into the typed form every
+    /// tool-choice gate speaks. Both the canonical wrapped shape
+    /// (`{"type": "function", "function": {...}}`) and the bare function-schema
+    /// shape (`{"name": ..., "parameters": ...}`) are accepted, matching what
+    /// the field itself passes through.
+    ///
+    /// Entries that are not a recognisable declaration are skipped rather than
+    /// erroring. This accessor answers "what did the request make callable";
+    /// deciding that a malformed declaration should be a 400 belongs to the
+    /// validator, which sees the same raw JSON.
+    pub fn declared_tools(&self) -> Vec<ChatCompletionTool> {
+        let Some(serde_json::Value::Array(entries)) = self.tools.as_ref() else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| {
+                serde_json::from_value::<ChatCompletionTool>(entry.clone())
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_value::<FunctionObject>(entry.clone())
+                            .ok()
+                            .map(|function| ChatCompletionTool {
+                                r#type: ChatCompletionToolType::Function,
+                                function,
+                            })
+                    })
+            })
+            .collect()
+    }
+}
+
+impl CreateChatCompletionRequest {
+    /// Every tool this request makes callable.
+    ///
+    /// Kimi K3 lets a system message declare tools inline (`messages[].tools`)
+    /// instead of, or in addition to, the request-level [`Self::tools`] array.
+    /// A declaration made that way is a real tool: `tool_choice: "required"`
+    /// must be satisfiable by it, and a call to it must be returned as a
+    /// `tool_calls` entry rather than suppressed. Every gate that asks "which
+    /// tools may be called" must therefore ask this, not [`Self::tools`].
+    ///
+    /// [`Self::tools`] stays the answer to one question only: what the prompt
+    /// renderer declares under its global tools preamble. The two declarations
+    /// render differently and their token counts differ, so hoisting
+    /// message-level tools into [`Self::tools`] is not an alternative to this
+    /// accessor — it would change the prompt.
+    ///
+    /// Order is request-level first, then message order. A name already
+    /// declared is not repeated, so a tool declared both globally and inline
+    /// appears once, with its request-level definition.
+    pub fn effective_tools(&self) -> Cow<'_, [ChatCompletionTool]> {
+        let request_level = self.tools.as_deref().unwrap_or(&[]);
+        let declared: Vec<ChatCompletionTool> = self
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatCompletionRequestMessage::System(system) => Some(system),
+                _ => None,
+            })
+            .flat_map(ChatCompletionRequestSystemMessage::declared_tools)
+            .collect();
+
+        if declared.is_empty() {
+            return Cow::Borrowed(request_level);
+        }
+
+        let mut effective = request_level.to_vec();
+        for tool in declared {
+            if !effective
+                .iter()
+                .any(|existing| existing.function.name == tool.function.name)
+            {
+                effective.push(tool);
+            }
+        }
+        Cow::Owned(effective)
+    }
+
+    /// Whether any tool is callable at all, message-level declarations included.
+    ///
+    /// The effective-list answer to `tools.is_none_or(Vec::is_empty)`, without
+    /// the allocation [`Self::effective_tools`] may make.
+    pub fn has_effective_tools(&self) -> bool {
+        if self.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+            return true;
+        }
+        self.messages.iter().any(|message| match message {
+            ChatCompletionRequestMessage::System(system) => !system.declared_tools().is_empty(),
+            _ => false,
+        })
+    }
+}
+
 /// Chat choice with extended response message.
 ///
 /// Uses our `ChatCompletionResponseMessage` (multimodal content + reasoning).
@@ -1792,6 +1891,199 @@ mod tests {
         match owned.content.unwrap() {
             ChatCompletionRequestSystemMessageContent::Text(text) => assert_eq!(text, "hi"),
             other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    // -- Effective tools: request-level plus message-level declarations --
+
+    fn request_with(value: serde_json::Value) -> CreateChatCompletionRequest {
+        serde_json::from_value(value).expect("request should deserialize")
+    }
+
+    fn weather_tool() -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather of a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        })
+    }
+
+    fn names(request: &CreateChatCompletionRequest) -> Vec<String> {
+        request
+            .effective_tools()
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn effective_tools_borrows_when_no_message_declares_any() {
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "tools": [weather_tool()],
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+
+        assert!(matches!(request.effective_tools(), Cow::Borrowed(_)));
+        assert_eq!(names(&request), ["get_weather"]);
+        assert!(request.has_effective_tools());
+    }
+
+    #[test]
+    fn effective_tools_includes_a_system_message_declaration() {
+        // The vendor's `test_tool_choice_required_with_only_dynamic_tools`
+        // shape: no request-level `tools` at all, one declared inline.
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "", "tools": [weather_tool()]},
+                {"role": "user", "content": "what is the weather in beijing?"},
+            ],
+        }));
+
+        assert_eq!(names(&request), ["get_weather"]);
+        assert!(
+            request.has_effective_tools(),
+            "a message-level declaration makes a tool callable"
+        );
+    }
+
+    #[test]
+    fn effective_tools_leaves_the_request_level_list_untouched() {
+        // What keeps the rendered prompt (and its token count) unchanged: the
+        // renderer reads `tools`, which must still see only the global array.
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "", "tools": [weather_tool()]},
+                {"role": "user", "content": "hi"},
+            ],
+        }));
+
+        assert_eq!(names(&request), ["get_weather"]);
+        assert!(request.tools.is_none(), "the global array is not rewritten");
+    }
+
+    #[test]
+    fn effective_tools_appends_declarations_after_the_global_list() {
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_stock_price", "parameters": {"type": "object"}},
+            }],
+            "messages": [
+                {"role": "system", "content": "", "tools": [weather_tool()]},
+                {"role": "user", "content": "hi"},
+            ],
+        }));
+
+        assert_eq!(names(&request), ["get_stock_price", "get_weather"]);
+    }
+
+    #[test]
+    fn effective_tools_collects_every_declaring_message_in_order() {
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "", "tools": [weather_tool()]},
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "", "tools": [{
+                    "type": "function",
+                    "function": {"name": "get_time", "parameters": {"type": "object"}},
+                }]},
+                {"role": "user", "content": "and the time?"},
+            ],
+        }));
+
+        assert_eq!(names(&request), ["get_weather", "get_time"]);
+    }
+
+    #[test]
+    fn effective_tools_does_not_repeat_a_name_declared_globally() {
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "tools": [weather_tool()],
+            "messages": [
+                {"role": "system", "content": "", "tools": [weather_tool()]},
+                {"role": "user", "content": "hi"},
+            ],
+        }));
+
+        assert_eq!(names(&request), ["get_weather"]);
+    }
+
+    #[test]
+    fn effective_tools_ignores_declarations_on_non_system_roles() {
+        // K3 allows the declaration on a system message only. A `tools` key
+        // anywhere else is not a tool the request made callable.
+        let request = request_with(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi", "tools": [weather_tool()]},
+                {"role": "assistant", "content": "hello", "tools": [weather_tool()]},
+            ],
+        }));
+
+        assert!(names(&request).is_empty());
+        assert!(!request.has_effective_tools());
+    }
+
+    #[test]
+    fn declared_tools_accepts_the_bare_function_schema_shape() {
+        let message = ChatCompletionRequestSystemMessage {
+            tools: Some(serde_json::json!([
+                {"name": "bare_tool", "parameters": {"type": "object"}}
+            ])),
+            ..Default::default()
+        };
+
+        let declared = message.declared_tools();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].function.name, "bare_tool");
+        assert!(matches!(
+            declared[0].r#type,
+            ChatCompletionToolType::Function
+        ));
+    }
+
+    #[test]
+    fn declared_tools_skips_entries_that_are_not_declarations() {
+        // Rejecting these is the validator's job. This accessor must not
+        // panic on them, and must not invent a tool out of one.
+        let message = ChatCompletionRequestSystemMessage {
+            tools: Some(serde_json::json!([
+                "not an object",
+                {"type": "function"},
+                weather_tool(),
+            ])),
+            ..Default::default()
+        };
+
+        let declared = message.declared_tools();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn declared_tools_is_empty_when_the_field_is_absent_or_not_an_array() {
+        for tools in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([])),
+        ] {
+            let message = ChatCompletionRequestSystemMessage {
+                tools,
+                ..Default::default()
+            };
+            assert!(message.declared_tools().is_empty());
         }
     }
 }
