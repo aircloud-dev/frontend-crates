@@ -50,6 +50,21 @@ const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 /// slots and every vision request failed. All 11 vendored `k3_vision_*`
 /// prompt-token cases returned HTTP 500 against `…-hgr5`.
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
+/// The one marker this renderer emits per video.
+///
+/// The checkpoint has no video marker, and neither does vLLM's K3 processor: the
+/// worker's video support is Hangar's runtime layer
+/// (`hangar/libs/runtime/kimi-k3-video`), which registers a video
+/// `PromptReplacement` targeting exactly this string. It must differ from
+/// [`IMAGE_PLACEHOLDER`] because vLLM counts replacement targets per modality:
+/// with one shared marker an image and a video in the same message both claim
+/// occurrence zero and one of them is never expanded. A distinct marker keeps
+/// both counts independent and keeps each item where the caller put it.
+///
+/// Encoded as ordinary text in its own segment, for the reason given on
+/// [`IMAGE_PLACEHOLDER`]. Before this, a video part rendered nothing at all, so
+/// the worker received a clip with no position in the prompt.
+const VIDEO_PLACEHOLDER: &str = "<|kimi_video_placeholder|>";
 const VALID_THINKING_EFFORTS: &[&str] = &["low", "high", "max"];
 /// Tokens in the prefilled channel opener, which the API must not bill.
 ///
@@ -378,6 +393,7 @@ fn render_content_segments(
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("image" | "image_url") => text(segments, IMAGE_PLACEHOLDER),
+                    Some("video" | "video_url") => text(segments, VIDEO_PLACEHOLDER),
                     _ => {
                         if let Some(part_text) = part.get("text") {
                             text(segments, value_as_body_text(part_text)?);
@@ -1246,6 +1262,48 @@ mod tests {
                     .any(|segment| segment.text == body && !segment.allow_special)
             );
         }
+    }
+
+    #[test]
+    fn renders_image_and_video_placeholders_in_source_order() {
+        for (first, second) in [("image_url", "video_url"), ("video_url", "image_url")] {
+            let part = |kind: &str| json!({"type": kind, kind: {"url": "http://example.com/m"}});
+            let mut request = Request::new(json!([{
+                "role": "user",
+                "content": [part(first), {"type": "text", "text": "describe both"}, part(second)]
+            }]));
+            request
+                .args
+                .insert("thinking".to_string(), Value::Bool(false));
+
+            let segments = image_segments(&fmt(), &request);
+            let markers: Vec<&RenderedSegment> = segments
+                .iter()
+                .filter(|segment| {
+                    segment.text == IMAGE_PLACEHOLDER || segment.text == VIDEO_PLACEHOLDER
+                })
+                .collect();
+
+            let expected = |kind: &str| {
+                if kind == "image_url" {
+                    IMAGE_PLACEHOLDER
+                } else {
+                    VIDEO_PLACEHOLDER
+                }
+            };
+            assert_eq!(
+                markers.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+                [expected(first), expected(second)],
+                "one marker per item, in the order the caller sent them"
+            );
+            assert!(markers.iter().all(|segment| !segment.allow_special));
+        }
+    }
+
+    #[test]
+    fn a_video_only_message_is_not_empty() {
+        let content = json!([{"type": "video_url", "video_url": {"url": "http://example.com/v.mp4"}}]);
+        assert!(!content_is_empty(Some(&content)).unwrap());
     }
 
     #[test]
