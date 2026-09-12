@@ -104,6 +104,38 @@ pub struct BasicReasoningParser {
     /// reasoning block (e.g. Kimi-K2/K2.5 models sometimes emit
     /// `<|tool_calls_section_begin|>` without first closing `</think>`).
     tool_start_tokens: Vec<String>,
+    /// Whether a reasoning span that reaches end-of-stream without ever handing
+    /// off to a visible channel is reported as normal text instead of reasoning.
+    ///
+    /// Kimi K3's generation prompt prefills the think opener, so the completion
+    /// begins inside the reasoning channel. When the model then never emits
+    /// `<|close|>think<|sep|>` and never opens another channel, every byte it
+    /// produced is classified as reasoning and `content` comes back empty at
+    /// `finish_reason: stop` — a blank reply for any client that reads
+    /// `message.content`, which is every OpenAI-compatible one. There is no
+    /// textual boundary to split on in that output: the channel the model was
+    /// writing in is the only one it ever opened, so its text is the answer.
+    markerless_eos_is_content: bool,
+    /// Markers whose appearance means the model handed reasoning off to a
+    /// visible channel rather than ending the message (Kimi K3's `<|open|>`).
+    /// Only these and `think_end_token` settle a span; a message-terminal
+    /// marker leaves it undecided until EOF. Empty for every other parser.
+    handoff_tokens: Vec<String>,
+    /// Set once this completion handed reasoning off to a visible channel, and
+    /// never cleared: from then on `content` has a source of its own and a
+    /// later unclosed reasoning span is genuinely reasoning.
+    handed_off: bool,
+    /// Reasoning already emitted for a span that has not handed off, retained
+    /// only under `markerless_eos_is_content` so `finish_reasoning_stream` can
+    /// re-emit it as normal text.
+    ///
+    /// The cost is one copy of the reasoning channel per in-flight request
+    /// until the span settles, which is what buying a non-empty `content` here
+    /// costs. Deferring the reasoning deltas instead would buy the same thing
+    /// without the copy and is rejected: K3 at `effort=max` reasons for minutes
+    /// on a long prompt, and holding the whole channel back means a stream with
+    /// no bytes on it for that long.
+    markerless_span: String,
 }
 
 impl BasicReasoningParser {
@@ -124,6 +156,10 @@ impl BasicReasoningParser {
             buffer_single_char_marker_prefix: false,
             recover_tool_start_without_opener: false,
             tool_start_tokens: Vec::new(),
+            markerless_eos_is_content: false,
+            handoff_tokens: Vec::new(),
+            handed_off: false,
+            markerless_span: String::new(),
         }
     }
 
@@ -149,6 +185,49 @@ impl BasicReasoningParser {
     pub fn with_single_char_marker_buffering(mut self) -> Self {
         self.buffer_single_char_marker_prefix = true;
         self
+    }
+
+    /// Reports a reasoning span that reaches end-of-stream without ever handing
+    /// off to a visible channel as normal text. See
+    /// `markerless_eos_is_content`. Pair with `with_handoff_token` for every
+    /// marker that does constitute a handoff, or the recovery will fire on
+    /// well-formed output too.
+    pub fn with_markerless_eos_as_content(mut self) -> Self {
+        self.markerless_eos_is_content = true;
+        self
+    }
+
+    /// Declares a marker that hands reasoning off to a visible channel, which
+    /// settles a span the way `think_end_token` does. See `handoff_tokens`.
+    pub fn with_handoff_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        if !token.is_empty() {
+            self.handoff_tokens.push(token);
+        }
+        self
+    }
+
+    /// Whether `text` at a force-exit offset is a handoff to a visible channel
+    /// rather than a marker that ends the message.
+    fn is_handoff(&self, text: &str) -> bool {
+        self.handoff_tokens
+            .iter()
+            .any(|marker| text.starts_with(marker.as_str()))
+    }
+
+    /// Latch a handoff: `content` now has a source of its own, so nothing held
+    /// for the markerless-EOS recovery is needed any more.
+    fn mark_handed_off(&mut self) {
+        self.handed_off = true;
+        self.markerless_span.clear();
+        self.markerless_span.shrink_to_fit();
+    }
+
+    /// Retain reasoning that has not yet handed off, so EOF can reclassify it.
+    fn retain_markerless(&mut self, text: &str) {
+        if self.markerless_eos_is_content && !self.handed_off {
+            self.markerless_span.push_str(text);
+        }
     }
 
     /// Allows a configured tool marker to be the first visible boundary of
@@ -219,6 +298,16 @@ impl ReasoningParser for BasicReasoningParser {
             && !text.contains(&self.think_end_token)
             && !has_tool_start
         {
+            // ...unless this parser reclassifies a span that never handed off:
+            // with no marker anywhere in the completion there is no second
+            // channel, so this text is the answer rather than reasoning about
+            // one. See `markerless_eos_is_content`.
+            if self.markerless_eos_is_content {
+                return ParserResult {
+                    normal_text: text.to_string(),
+                    reasoning_text: String::new(),
+                };
+            }
             return ParserResult {
                 normal_text: String::new(),
                 reasoning_text: text.to_string(),
@@ -230,6 +319,10 @@ impl ReasoningParser for BasicReasoningParser {
         let mut normal_parts = Vec::new();
         let mut cursor = 0;
         let mut exited_on_tool_start = false;
+        // Whether reasoning handed off to a visible channel anywhere in this
+        // text. Tracked locally because the batch path owns no streaming state.
+        // See `markerless_eos_is_content`.
+        let mut handed_off = false;
         // Initial loop state combines two concerns:
         //   - dangling-end recovery: enter reasoning at cursor 0 so the prefix
         //     before `</think>` is captured (otherwise the normal-text branch
@@ -257,6 +350,7 @@ impl ReasoningParser for BasicReasoningParser {
                     (Some(e), Some(t)) if t < e => {
                         // tool_start arrives before </think> — force-exit.
                         reasoning_parts.push(&text[cursor..cursor + t]);
+                        handed_off |= self.is_handoff(&text[cursor + t..]);
                         normal_parts.push(&text[cursor + t..]);
                         cursor = text.len();
                         currently_reasoning = false;
@@ -264,12 +358,14 @@ impl ReasoningParser for BasicReasoningParser {
                     }
                     (Some(e), _) => {
                         reasoning_parts.push(&text[cursor..cursor + e]);
+                        handed_off = true;
                         cursor += e + self.think_end_token.len();
                         currently_reasoning = false;
                     }
                     (None, Some(t)) => {
                         // No </think> but tool_start is present — force-exit.
                         reasoning_parts.push(&text[cursor..cursor + t]);
+                        handed_off |= self.is_handoff(&text[cursor + t..]);
                         normal_parts.push(&text[cursor + t..]);
                         cursor = text.len();
                         currently_reasoning = false;
@@ -292,11 +388,13 @@ impl ReasoningParser for BasicReasoningParser {
                     (Some(s), Some(e)) if s <= e => {
                         // <think> appears first → enter reasoning normally.
                         normal_parts.push(&text[cursor..cursor + s]);
+                        handed_off |= s > 0;
                         cursor += s + self.think_start_token.len();
                         currently_reasoning = true;
                     }
                     (Some(s), None) => {
                         normal_parts.push(&text[cursor..cursor + s]);
+                        handed_off |= s > 0;
                         cursor += s + self.think_start_token.len();
                         currently_reasoning = true;
                     }
@@ -304,6 +402,7 @@ impl ReasoningParser for BasicReasoningParser {
                         // Stray </think> before the next <think> (or no <think> at all).
                         // Drop the marker, keep the text on both sides, stay in normal mode.
                         normal_parts.push(&text[cursor..cursor + e]);
+                        handed_off = true;
                         cursor += e + self.think_end_token.len();
                     }
                     (None, None) => {
@@ -322,6 +421,21 @@ impl ReasoningParser for BasicReasoningParser {
             joined_reasoning_text.trim().to_string()
         };
         let normal_text = normal_parts.join("").trim().to_string();
+
+        // No handoff anywhere in this completion means the reasoning channel is
+        // the only one the model wrote in, so what it holds is the answer. The
+        // batch path sees the whole text at once and can move it rather than
+        // copy it. See `markerless_eos_is_content`.
+        if self.markerless_eos_is_content && !handed_off && !reasoning_text.is_empty() {
+            let mut recovered = reasoning_text;
+            if !normal_text.is_empty() {
+                recovered.push_str(&normal_text);
+            }
+            return ParserResult {
+                normal_text: recovered,
+                reasoning_text: String::new(),
+            };
+        }
 
         // Note: self._in_reasoning is intentionally NOT updated here. This method is
         // documented to "reset or ignore internal streaming state" (see trait doc). Callers
@@ -397,6 +511,15 @@ impl ReasoningParser for BasicReasoningParser {
 
                 if let Some(tool_at) = force_exit_idx {
                     accumulated_reasoning.push_str(&current_text[..tool_at]);
+                    // A marker that opens another channel settles the span; one
+                    // that ends the message leaves it undecided, because then
+                    // the reasoning channel is the only one the model ever
+                    // wrote in. See `markerless_eos_is_content`.
+                    if self.is_handoff(&current_text[tool_at..]) {
+                        self.mark_handed_off();
+                    } else {
+                        self.retain_markerless(&current_text[..tool_at]);
+                    }
                     accumulated_normal.push_str(&current_text[tool_at..]);
                     self._buffer.clear();
                     self._in_reasoning = false;
@@ -408,6 +531,8 @@ impl ReasoningParser for BasicReasoningParser {
                 if let Some(end_idx) = end_idx {
                     // End of reasoning block: accumulate content and transition out.
                     accumulated_reasoning.push_str(&current_text[..end_idx]);
+                    // The close marker is the handoff the recovery waits for.
+                    self.mark_handed_off();
                     let after_end = end_idx + self.think_end_token.len();
                     self._buffer = current_text[after_end..].to_string();
                     self._in_reasoning = false;
@@ -434,10 +559,12 @@ impl ReasoningParser for BasicReasoningParser {
                             let safe_end = current_text.len() - ol;
                             if safe_end > 0 {
                                 accumulated_reasoning.push_str(&current_text[..safe_end]);
+                                self.retain_markerless(&current_text[..safe_end]);
                             }
                             self._buffer = current_text[safe_end..].to_string();
                         } else {
                             accumulated_reasoning.push_str(&current_text);
+                            self.retain_markerless(&current_text);
                             self._buffer.clear();
                         }
                     }
@@ -471,6 +598,11 @@ impl ReasoningParser for BasicReasoningParser {
                     if start_before_boundary {
                         // <think> arrives first → enter reasoning.
                         accumulated_normal.push_str(&current_text[..start_pos]);
+                        // Text outside any reasoning block is already an answer,
+                        // so a span opened after it never needs reclassifying.
+                        if start_pos > 0 {
+                            self.mark_handed_off();
+                        }
                         let after_start = start_pos + self.think_start_token.len();
                         self._buffer = current_text[after_start..].to_string();
                         self._in_reasoning = true;
@@ -484,6 +616,11 @@ impl ReasoningParser for BasicReasoningParser {
                     .filter(|tool_pos| end_pos.map(|end_pos| *tool_pos < end_pos).unwrap_or(true));
                 if let Some(tool_pos) = tool_before_end {
                     accumulated_reasoning.push_str(&current_text[..tool_pos]);
+                    if self.is_handoff(&current_text[tool_pos..]) {
+                        self.mark_handed_off();
+                    } else {
+                        self.retain_markerless(&current_text[..tool_pos]);
+                    }
                     accumulated_normal.push_str(&current_text[tool_pos..]);
                     self._buffer.clear();
                     self._in_reasoning = false;
@@ -503,6 +640,9 @@ impl ReasoningParser for BasicReasoningParser {
                     } else {
                         accumulated_normal.push_str(&current_text[..end_pos]);
                     }
+                    // Either way the model closed the channel, which is the
+                    // handoff the markerless-EOS recovery waits for.
+                    self.mark_handed_off();
                     let after_end = end_pos + self.think_end_token.len();
                     self._buffer = current_text[after_end..].to_string();
                     self._in_reasoning = false;
@@ -562,7 +702,27 @@ impl ReasoningParser for BasicReasoningParser {
         }
     }
 
+    fn finalizes_at_eos(&self) -> bool {
+        self.markerless_eos_is_content
+    }
+
     fn finish_reasoning_stream(&mut self) -> ParserResult {
+        // A span that never handed off to a visible channel is the answer: no
+        // other channel was ever opened to carry one. Emit it as normal text so
+        // `content` is non-empty, buffered tail included. The same bytes already
+        // left as reasoning deltas and cannot be recalled, so a streaming caller
+        // sees them twice; the batch path below moves them instead of copying.
+        // See `markerless_eos_is_content`.
+        if self.markerless_eos_is_content && !self.handed_off && !self.markerless_span.is_empty() {
+            let mut recovered = std::mem::take(&mut self.markerless_span);
+            recovered.push_str(&std::mem::take(&mut self._buffer));
+            self.mark_handed_off();
+            return ParserResult {
+                normal_text: recovered,
+                reasoning_text: String::new(),
+            };
+        }
+
         if self._buffer.is_empty() {
             return ParserResult::default();
         }

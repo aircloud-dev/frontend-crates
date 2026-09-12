@@ -160,6 +160,18 @@ pub trait ReasoningParser: Send + std::fmt::Debug {
         ParserResult::default()
     }
 
+    /// Whether this parser must be finalized at end-of-stream for its split to
+    /// be correct, rather than only to flush a buffered delimiter prefix.
+    ///
+    /// A parser whose model prefills the reasoning opener in the prompt cannot
+    /// know until EOF whether an unclosed span was reasoning or the answer
+    /// itself, so dropping its state at end-of-stream drops the answer. Callers
+    /// that would otherwise skip `finish_reasoning_stream` must call it when
+    /// this returns true.
+    fn finalizes_at_eos(&self) -> bool {
+        false
+    }
+
     /// Override the parser's initial reasoning state. When called with `true`, the parser
     /// starts in reasoning mode without waiting for the start token in the completion stream.
     /// Use this when the chat template already injected the start token (e.g., `<think>`)
@@ -229,6 +241,10 @@ impl ReasoningParser for ReasoningParserWrapper {
 
     fn finish_reasoning_stream(&mut self) -> ParserResult {
         self.parser.finish_reasoning_stream()
+    }
+
+    fn finalizes_at_eos(&self) -> bool {
+        self.parser.finalizes_at_eos()
     }
 
     fn set_in_reasoning(&mut self, in_reasoning: bool) {
@@ -305,7 +321,19 @@ impl ReasoningParserType {
                             // next backend chunk completes or disproves it.
                             .with_single_char_marker_buffering()
                             // The prompt normally consumes the think opener.
-                            .with_dangling_end_recovery(),
+                            .with_dangling_end_recovery()
+                            // Opening any channel is a handoff; `<|close|>…` and
+                            // `<|end_of_msg|>` end the message instead, so a
+                            // think channel that runs into one never produced a
+                            // visible channel at all.
+                            .with_handoff_token("<|open|>")
+                            // The model sometimes stops without closing the
+                            // think channel on ~1M-token prompts: `stop`,
+                            // normal `completion_tokens`, and every byte
+                            // classified as reasoning, so `content` comes back
+                            // empty. That output has no response channel to
+                            // recover one from, so the span is the answer.
+                            .with_markerless_eos_as_content(),
                     ),
                 }
             }
@@ -1255,6 +1283,134 @@ mod tests {
         assert_eq!(recovered.normal_text, forced.normal_text);
     }
 
+    /// The same live shape with the closer missing, which is what ~1M-token
+    /// prompts produce a third of the time: `finish_reason: stop`, ordinary
+    /// `completion_tokens`, and not one channel marker in the completion. The
+    /// prompt prefilled `<|open|>think<|sep|>`, so Dynamo's frontend seeds the
+    /// parser in-reasoning (`prompt_injected_reasoning_start`) and every byte
+    /// used to be classified as reasoning, leaving `content` empty for any
+    /// caller that reads `message.content`.
+    ///
+    /// There is no response channel in this output to recover an answer from, so
+    /// the span the model did write is the answer.
+    #[test]
+    fn test_kimi_k3_markerless_eos_recovers_answer_as_content() {
+        const LIVE: &str = "**17 × 23 = 391**";
+
+        // Streaming, seeded the way the frontend seeds it. The span already left
+        // as reasoning deltas, so EOF re-emits it as content rather than moving
+        // it — the deltas cannot be recalled.
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        parser.set_in_reasoning(true);
+        let streamed = parser.parse_reasoning_streaming_incremental(LIVE, &[]);
+        let finished = parser.finish_reasoning_stream();
+        assert_eq!(streamed.normal_text, "");
+        assert_eq!(finished.normal_text, LIVE);
+        assert_eq!(finished.reasoning_text, "");
+
+        // Chunk boundaries must not change where it lands.
+        for split in 1..LIVE.len() {
+            if !LIVE.is_char_boundary(split) {
+                continue;
+            }
+            let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+            parser.set_in_reasoning(true);
+            let first = parser.parse_reasoning_streaming_incremental(&LIVE[..split], &[]);
+            let second = parser.parse_reasoning_streaming_incremental(&LIVE[split..], &[]);
+            let finished = parser.finish_reasoning_stream();
+            assert_eq!(
+                format!(
+                    "{}{}{}",
+                    first.normal_text, second.normal_text, finished.normal_text
+                ),
+                LIVE,
+                "split {split} lost or misplaced the answer"
+            );
+            assert_eq!(finished.reasoning_text, "");
+        }
+
+        // The batch path sees the whole completion at once, so it moves the span
+        // instead of copying it: nothing is left in `reasoning_text`.
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        parser.set_in_reasoning(true);
+        let batch = parser.detect_and_parse_reasoning(LIVE, &[]);
+        assert_eq!(batch.normal_text, LIVE);
+        assert_eq!(batch.reasoning_text, "");
+    }
+
+    /// Same pathology one step later: the model closes the *message* without
+    /// ever closing the think channel or opening a response one. The closer is a
+    /// force-exit marker, so the text before it was reported as reasoning and
+    /// `content` carried only markup the tool-call jail then strips — empty
+    /// again. Ending the message is not a handoff, so the span is still the
+    /// answer.
+    #[test]
+    fn test_kimi_k3_message_close_without_handoff_recovers_answer_as_content() {
+        const LIVE: &str = concat!(
+            "**17 × 23 = 391**",
+            "<|close|>message<|sep|>",
+            "<|end_of_msg|>"
+        );
+        const ANSWER: &str = "**17 × 23 = 391**";
+
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        parser.set_in_reasoning(true);
+        let streamed = parser.parse_reasoning_streaming_incremental(LIVE, &[]);
+        let finished = parser.finish_reasoning_stream();
+        assert_eq!(streamed.reasoning_text, ANSWER);
+        assert!(
+            !streamed.normal_text.contains(ANSWER),
+            "the answer must not be reported twice in one delta: {}",
+            streamed.normal_text
+        );
+        assert_eq!(finished.normal_text, ANSWER);
+        assert_eq!(finished.reasoning_text, "");
+
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        parser.set_in_reasoning(true);
+        let batch = parser.detect_and_parse_reasoning(LIVE, &[]);
+        assert_eq!(batch.reasoning_text, "");
+        assert!(batch.normal_text.starts_with(ANSWER));
+    }
+
+    /// The recovery must not fire on well-formed output: a completion that closes
+    /// the think channel has a response channel to carry the answer, so its
+    /// reasoning stays reasoning and `finish_reasoning_stream` adds nothing.
+    #[test]
+    fn test_kimi_k3_closed_think_channel_keeps_reasoning_at_eos() {
+        let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        parser.set_in_reasoning(true);
+        let streamed = parser.parse_reasoning_streaming_incremental(
+            "17 × 23 = 391<|close|>think<|sep|><|open|>response<|sep|>**391**",
+            &[],
+        );
+        let finished = parser.finish_reasoning_stream();
+
+        assert_eq!(streamed.reasoning_text, "17 × 23 = 391");
+        assert_eq!(streamed.normal_text, "<|open|>response<|sep|>**391**");
+        assert_eq!(finished.normal_text, "");
+        assert_eq!(finished.reasoning_text, "");
+    }
+
+    /// And it is K3-only: the `<think>`-family parsers keep reporting an
+    /// unclosed span as reasoning, which is what a truncated DeepSeek-R1 style
+    /// completion means.
+    #[test]
+    fn test_markerless_eos_recovery_is_not_enabled_for_think_parsers() {
+        for name in ["qwen3", "deepseek_r1", "kimi_k25"] {
+            let mut parser = ReasoningParserType::get_reasoning_parser_from_name(name);
+            parser.set_in_reasoning(true);
+            let streamed = parser.parse_reasoning_streaming_incremental("unclosed thought", &[]);
+            let finished = parser.finish_reasoning_stream();
+            assert_eq!(streamed.reasoning_text, "unclosed thought", "{name}");
+            assert_eq!(finished.normal_text, "", "{name}");
+            assert!(!parser.finalizes_at_eos(), "{name}");
+        }
+        let mut k3 = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
+        assert!(k3.finalizes_at_eos());
+        k3.set_in_reasoning(true);
+    }
+
     #[test]
     fn test_kimi_k3_streaming_dangling_close_split_across_chunks() {
         let mut parser = ReasoningParserType::get_reasoning_parser_from_name("kimi_k3");
@@ -1600,8 +1756,12 @@ mod tests {
 
         assert_eq!(streamed.reasoning_text, "literal");
         assert_eq!(streamed.normal_text, "");
-        assert_eq!(finished.reasoning_text, "<");
-        assert_eq!(finished.normal_text, "");
+        // The buffered `<` is still not dropped, but this completion closed no
+        // channel and opened none, so the whole span is the answer and comes
+        // back as normal text rather than reasoning. See
+        // `test_kimi_k3_markerless_eos_recovers_answer_as_content`.
+        assert_eq!(finished.normal_text, "literal<");
+        assert_eq!(finished.reasoning_text, "");
     }
 
     #[test]
