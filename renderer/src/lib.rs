@@ -122,6 +122,7 @@ impl RenderedSegment {
 pub struct RenderedPrompt {
     text: String,
     segments: Option<Vec<RenderedSegment>>,
+    pending_tokens: u32,
 }
 
 impl RenderedPrompt {
@@ -129,6 +130,7 @@ impl RenderedPrompt {
         Self {
             text,
             segments: None,
+            pending_tokens: 0,
         }
     }
 
@@ -140,7 +142,32 @@ impl RenderedPrompt {
         Self {
             text,
             segments: Some(segments),
+            pending_tokens: 0,
         }
+    }
+
+    /// Declare a trailing run of prompt tokens the API must not report.
+    ///
+    /// These tokens are really in the prompt: they are encoded, they are sent,
+    /// and the engine attends to them. They are simply not the caller's prompt.
+    /// A generation-prompt stub belongs to the completion the model is about to
+    /// write, and a vendor that accounts it there reports
+    /// `usage.prompt_tokens` without it — so it is rendered and then
+    /// subtracted at the reporting boundary, never dropped from the prompt.
+    ///
+    /// A suffix, not a count anywhere: the stub is the last thing rendered,
+    /// which is what lets a consumer subtract it without knowing which tokens
+    /// it was.
+    pub fn with_pending_tokens(mut self, pending_tokens: u32) -> Self {
+        self.pending_tokens = pending_tokens;
+        self
+    }
+
+    /// Prompt tokens rendered for the model that the API must not bill.
+    ///
+    /// Zero for every formatter that does not prefill a generation stub.
+    pub fn pending_tokens(&self) -> u32 {
+        self.pending_tokens
     }
 
     pub fn as_str(&self) -> &str {
@@ -366,6 +393,24 @@ mod rendered_prompt_tests {
         assert_eq!(segments[1].text, "user text");
         assert!(!segments[1].allow_special);
         assert_eq!(prompt.as_str(), "<|open|>user text");
+    }
+
+    #[test]
+    fn prompts_declare_no_pending_tokens_unless_asked() {
+        assert_eq!(RenderedPrompt::text("body".to_string()).pending_tokens(), 0);
+        assert_eq!(
+            RenderedPrompt::segmented(vec![RenderedSegment::new("body", false)]).pending_tokens(),
+            0
+        );
+
+        let prompt = RenderedPrompt::segmented(vec![
+            RenderedSegment::new("body", false),
+            RenderedSegment::new("<|open|>", true),
+        ])
+        .with_pending_tokens(3);
+
+        assert_eq!(prompt.pending_tokens(), 3);
+        assert_eq!(prompt.as_str(), "body<|open|>");
     }
 
     #[test]

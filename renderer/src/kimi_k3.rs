@@ -42,20 +42,42 @@ const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 /// `<|kimi_image_placeholder|>` is only its `None` fallback.
 const MEDIA_PAD: &str = "<|media_pad|>";
 const VALID_THINKING_EFFORTS: &[&str] = &["low", "high", "max"];
+/// Tokens in the prefilled channel opener, which the API must not bill.
+///
+/// The generation prompt ends `<|open|>think<|sep|>` or
+/// `<|open|>response<|sep|>`, and each of those three segments is one token.
+/// Measured against moonshotai/Kimi-K3's own `tiktoken.model`, encoded the way
+/// [`RenderedPrompt::encode_segments`] feeds a tokenizer — `<|open|>` 163587
+/// and `<|sep|>` 163589 as special ids, the channel name as ordinary text:
+/// `think` 39964, `response` 12092. Three in both thinking modes, which is why
+/// the discount is flat rather than mode-dependent.
+///
+/// Rendered, not reported. The opener has to be in the prompt: without it the
+/// served checkpoint never opens a think channel, so `reasoning_content` is
+/// always null, and with thinking off it emits a phantom `thinking` tool call.
+/// Moonshot's own `encoding_k3.py` prefills it too. But it is the opening of
+/// the completion the model is about to write rather than part of what the
+/// caller sent, and the vendor accounts it on the completion side: their
+/// groundtruth is `len(golden prompt ids) - 3`, and
+/// `tests/k3_features/test_response_format.py` states that
+/// `usage.prompt_tokens` is tokenism's `total_tokens - pending_tokens`.
+///
+/// Only the channel opener, not the assistant `message` tag before it: the
+/// vendor counts the open turn and discounts these three tokens alone.
+const PENDING_OPENER_TOKENS: u32 = 3;
 
-#[derive(Debug, Clone)]
-pub struct KimiK3Formatter {
-    exclude_tools_when_tool_choice_none: bool,
-}
+#[derive(Debug, Clone, Default)]
+pub struct KimiK3Formatter;
 
 impl KimiK3Formatter {
-    pub fn new(exclude_tools_when_tool_choice_none: bool) -> Self {
-        Self {
-            exclude_tools_when_tool_choice_none,
-        }
+    pub fn new() -> Self {
+        Self
     }
 
-    fn build_segments(&self, req: &dyn OAIChatLikeRequest) -> Result<Vec<RenderedSegment>> {
+    /// The segments, plus how many trailing tokens are the generation stub.
+    ///
+    /// See [`PENDING_OPENER_TOKENS`]. Zero whenever no stub was appended.
+    fn build_segments(&self, req: &dyn OAIChatLikeRequest) -> Result<(Vec<RenderedSegment>, u32)> {
         let messages = json_value(req.messages()).context("Failed to convert K3 messages")?;
         let messages = messages
             .as_array()
@@ -64,7 +86,7 @@ impl KimiK3Formatter {
 
         let tool_choice = req.tool_choice().map(json_value).transpose()?;
         let (tool_choice_kind, named_tool) = resolve_tool_choice(tool_choice.as_ref())?;
-        let mut tools = req.tools().map(json_value).transpose()?;
+        let tools = req.tools().map(json_value).transpose()?;
         // A named tool_choice may target a message-level declaration that
         // never appears in the top-level list.
         if let Some(named_tool) = named_tool
@@ -79,9 +101,6 @@ impl KimiK3Formatter {
                 "tool named {named_tool:?} in tool_choice is not present in tools"
             ))
             .into());
-        }
-        if self.exclude_tools_when_tool_choice_none && tool_choice_kind == Some("none") {
-            tools = None;
         }
         let tools = tools.map(deep_sort);
 
@@ -118,11 +137,13 @@ impl OAIPromptFormatter for KimiK3Formatter {
     }
 
     fn render(&self, req: &dyn OAIChatLikeRequest) -> Result<String> {
-        Ok(RenderedPrompt::segmented(self.build_segments(req)?).into_text())
+        let (segments, _pending_tokens) = self.build_segments(req)?;
+        Ok(RenderedPrompt::segmented(segments).into_text())
     }
 
     fn render_prompt(&self, req: &dyn OAIChatLikeRequest) -> Result<RenderedPrompt> {
-        Ok(RenderedPrompt::segmented(self.build_segments(req)?))
+        let (segments, pending_tokens) = self.build_segments(req)?;
+        Ok(RenderedPrompt::segmented(segments).with_pending_tokens(pending_tokens))
     }
 }
 
@@ -825,7 +846,7 @@ fn build_chat_segments(
     add_generation_prompt: bool,
     thinking: bool,
     thinking_effort: &str,
-) -> Result<Vec<RenderedSegment>> {
+) -> Result<(Vec<RenderedSegment>, u32)> {
     let mut segments = Vec::new();
     let mut previous_tool_calls: Option<&Value> = None;
     let mut tool_index = 0usize;
@@ -1031,6 +1052,7 @@ fn build_chat_segments(
     // A partial assistant turn *is* the generation prompt: it is left open so
     // the model continues from its prefix, so the generic prompt is skipped
     // regardless of `add_generation_prompt`.
+    let mut pending_tokens = 0;
     if let Some(partial) = partial_tail {
         render_partial_assistant_segments(&mut segments, partial, thinking)?;
     } else if add_generation_prompt {
@@ -1044,9 +1066,10 @@ fn build_chat_segments(
             if thinking { "think" } else { "response" },
             [],
         );
+        pending_tokens = PENDING_OPENER_TOKENS;
     }
 
-    Ok(segments)
+    Ok((segments, pending_tokens))
 }
 
 #[cfg(test)]
@@ -1109,7 +1132,7 @@ mod tests {
 
     /// Default formatter: no worker declaration, so the checkpoint token.
     fn fmt() -> KimiK3Formatter {
-        KimiK3Formatter::new(true)
+        KimiK3Formatter::new()
     }
 
     /// One user message carrying a single image part.
@@ -1131,6 +1154,89 @@ mod tests {
             .segments()
             .expect("K3 always renders segmented prompts")
             .to_vec()
+    }
+
+    #[test]
+    fn generation_prompt_declares_the_channel_opener_as_pending() {
+        for thinking in [true, false] {
+            let mut request = Request::new(json!([{"role": "user", "content": "hi"}]));
+            request
+                .args
+                .insert("thinking".to_string(), Value::Bool(thinking));
+
+            let prompt = fmt().render_prompt(&request).unwrap();
+
+            assert_eq!(
+                prompt.pending_tokens(),
+                PENDING_OPENER_TOKENS,
+                "thinking={thinking}"
+            );
+            // The count is subtractable only because the stub is a suffix, and
+            // correct only because each of those three segments is one token.
+            let segments = prompt.segments().expect("K3 renders segmented prompts");
+            let tail: Vec<&str> = segments
+                .iter()
+                .rev()
+                .take(3)
+                .map(|segment| segment.text.as_str())
+                .collect();
+            assert_eq!(
+                tail,
+                [
+                    SEP_TOKEN,
+                    if thinking { "think" } else { "response" },
+                    OPEN_TOKEN
+                ],
+                "the pending tokens must be exactly the trailing channel opener"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_assistant_turn_has_no_pending_tokens() {
+        // The partial turn *is* the generation prompt, and every token in it is
+        // caller-supplied prefix, so none of it is a stub to discount.
+        let mut request = Request::new(json!([
+            {"role": "user", "content": "Greet the customer"},
+            {"role": "assistant", "content": "Dear customer, hello", "partial": true}
+        ]));
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        assert_eq!(fmt().render_prompt(&request).unwrap().pending_tokens(), 0);
+    }
+
+    #[test]
+    fn no_generation_prompt_means_no_pending_tokens() {
+        let mut request = Request::new(json!([{"role": "user", "content": "hi"}]));
+        request.add_generation_prompt = false;
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        assert_eq!(fmt().render_prompt(&request).unwrap().pending_tokens(), 0);
+    }
+
+    #[test]
+    fn tool_choice_none_keeps_the_tool_declarations() {
+        let mut request = Request::new(json!([{"role": "user", "content": "Weather?"}]));
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+        request.tools = Some(json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]));
+        request.tool_choice = Some(json!("none"));
+
+        let rendered = fmt().render(&request).unwrap();
+
+        assert!(
+            rendered.contains("# Tools") && rendered.contains("get_weather"),
+            "K3 declares its tools under tool_choice=none"
+        );
+        assert!(rendered.contains("The system is invoked with `tool_choice=none`."));
     }
 
     #[test]
