@@ -5,6 +5,7 @@
 // extensions on top. Types prefixed with `Dynamo` or entirely absent from the
 // upstream spec are documented with the rationale for the extension.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 
 use derive_builder::Builder;
@@ -1138,6 +1139,125 @@ impl CreateChatCompletionRequest {
     pub fn effective_tool_contains(&self, name: &str) -> bool {
         self.effective_tool_names().any(|tool| tool == name)
     }
+
+    /// Every declared tool in typed form: top-level `tools` first, then
+    /// dynamic system-message declarations in message order.
+    ///
+    /// The name-based accessors above answer "is this tool declared". This
+    /// answers "what is it", for the consumers that read `name`, `parameters`
+    /// and `strict` off a declaration — tool-argument validation, a named
+    /// `tool_choice` check, and the JSON-schema and grammar builders. Those
+    /// need a [`ChatCompletionTool`], and a dynamically declared tool is a real
+    /// tool: refusing it there means the model is shown a tool it may then not
+    /// call.
+    ///
+    /// This is a view, never a replacement. [`ChatCompletionRequestSystemMessage::tools`]
+    /// stays the raw JSON it was received as, and stays what the prompt renders
+    /// from, so a vendor-specific key serde does not know about is still on the
+    /// wire and still in the prompt. Nothing is dropped by reading this; the
+    /// typed projection is derived on demand and written back nowhere.
+    ///
+    /// An entry that cannot be read as a declaration is an error, not a
+    /// skipped entry. Moonshot answers 400 to every malformed variant — a
+    /// missing `type`, a missing or unnamed `function`, a non-object entry,
+    /// and a list that mixes one good declaration with one bad one — so
+    /// excluding the bad entry and serving the request would declare fewer
+    /// tools than the caller asked for and diverge from the provider. This is
+    /// the one place the two answers differ: [`Self::effective_tool_names`]
+    /// skips what it cannot name, because naming is all it promises.
+    ///
+    /// Order is preserved and nothing is collapsed, a name declared twice
+    /// included. A duplicate name is a request error in its own right, raised
+    /// where declarations are rendered; silently merging the second
+    /// declaration into the first here would be the same silent loss this
+    /// accessor exists to avoid.
+    pub fn effective_tools(&self) -> Result<Cow<'_, [ChatCompletionTool]>, DynamicToolError> {
+        let top_level = self.tools.as_deref().unwrap_or_default();
+
+        let mut declared: Vec<ChatCompletionTool> = Vec::new();
+        for (message_index, message) in self.messages.iter().enumerate() {
+            let ChatCompletionRequestMessage::System(system) = message else {
+                continue;
+            };
+            let Some(entries) = system.tools.as_deref() else {
+                continue;
+            };
+            for (entry_index, entry) in entries.iter().enumerate() {
+                declared.push(
+                    typed_dynamic_tool(entry).map_err(|reason| DynamicToolError {
+                        location: format!("messages[{message_index}].tools[{entry_index}]"),
+                        reason,
+                    })?,
+                );
+            }
+        }
+
+        if declared.is_empty() {
+            return Ok(Cow::Borrowed(top_level));
+        }
+        let mut effective = top_level.to_vec();
+        effective.append(&mut declared);
+        Ok(Cow::Owned(effective))
+    }
+}
+
+/// One dynamic tool declaration that could not be read as a function tool,
+/// named by where it was declared.
+///
+/// Renders as `messages[0].tools[1] is not a function tool.` — the location a
+/// client can act on, in the same shape as the rest of this crate's
+/// request-shape errors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{location} {reason}")]
+pub struct DynamicToolError {
+    /// JSON path of the offending entry, e.g. `messages[0].tools[1]`.
+    pub location: String,
+    pub reason: DynamicToolErrorReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DynamicToolErrorReason {
+    /// Not an object, or an object whose `type`/`function` pair does not
+    /// declare a function.
+    #[error("is not a function tool.")]
+    NotAFunctionTool,
+    /// Shaped like a declaration, but not one this crate can read.
+    #[error("is not a valid function tool: {0}.")]
+    Malformed(String),
+}
+
+/// Read one raw `messages[].tools` entry as a [`ChatCompletionTool`].
+///
+/// Accepts the two shapes the field itself passes through: the OpenAI wrapped
+/// form `{"type": "function", "function": {...}}`, and the bare function
+/// schema `{"name": ..., "parameters": ...}` that Kimi clients send. A
+/// `function` object with no `type` naming it is rejected rather than guessed
+/// at, which is what the prompt renderer does with the same entry.
+///
+/// Lossless for everything the call sites read: `parameters` is carried as
+/// raw JSON, so vendor extensions inside the schema survive. Keys beside the
+/// standard ones are not represented in [`FunctionObject`] and are therefore
+/// absent from the returned value — they are not lost, because the entry this
+/// reads from is kept and rendered as received.
+pub fn typed_dynamic_tool(
+    entry: &serde_json::Value,
+) -> Result<ChatCompletionTool, DynamicToolErrorReason> {
+    let object = entry
+        .as_object()
+        .ok_or(DynamicToolErrorReason::NotAFunctionTool)?;
+
+    let function = match (object.get("type"), object.get("function")) {
+        (Some(kind), Some(function)) if kind.as_str() == Some("function") => function,
+        (Some(_), _) | (None, Some(_)) => return Err(DynamicToolErrorReason::NotAFunctionTool),
+        (None, None) => entry,
+    };
+
+    serde_json::from_value::<FunctionObject>(function.clone())
+        .map(|function| ChatCompletionTool {
+            r#type: ChatCompletionToolType::Function,
+            function,
+        })
+        .map_err(|error| DynamicToolErrorReason::Malformed(error.to_string()))
 }
 
 /// Name of a dynamic system-message tool entry.
@@ -2136,6 +2256,175 @@ mod tests {
             !request.effective_tool_contains("no name, skipped"),
             "a description is not a name"
         );
+    }
+
+    #[test]
+    fn effective_tools_borrows_when_only_the_top_level_list_declares() {
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "add", "parameters": {"type": "object"}}
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let effective = request.effective_tools().unwrap();
+        assert!(matches!(effective, Cow::Borrowed(_)));
+        assert_eq!(effective[0].function.name, "add");
+    }
+
+    #[test]
+    fn effective_tools_appends_dynamic_declarations_in_message_order() {
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "dummy-kimi-model",
+            "tools": [{
+                "type": "function",
+                "function": {"name": "add", "parameters": {"type": "object"}}
+            }],
+            "messages": [
+                {
+                    "role": "system",
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                            "strict": true
+                        }
+                    }]
+                },
+                {"role": "user", "content": "go"},
+                {"role": "system", "tools": [{"name": "search", "parameters": {"type": "object"}}]}
+            ]
+        }))
+        .unwrap();
+
+        let effective = request.effective_tools().unwrap();
+        assert_eq!(
+            effective
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "lookup", "search"],
+            "top-level first, then dynamic in message order; wrapped and bare shapes both resolve"
+        );
+        assert_eq!(effective[1].function.strict, Some(true));
+        assert_eq!(
+            effective[1].function.parameters,
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {"q": {"type": "string"}}
+            })),
+            "the declared schema is what the grammar builders read"
+        );
+        assert!(
+            request.tools.as_ref().is_some_and(|tools| tools.len() == 1),
+            "the top-level list is a view's input, never rewritten by reading it"
+        );
+    }
+
+    #[test]
+    fn effective_tools_rejects_a_malformed_entry_beside_a_valid_one() {
+        // Moonshot answers 400 to this mix rather than serving the good half.
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "dummy-kimi-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "tools": [
+                        {"type": "function", "function": {"name": "lookup"}},
+                        {"type": "retrieval", "function": {"name": "nope"}}
+                    ]
+                },
+                {"role": "user", "content": "go"}
+            ]
+        }))
+        .unwrap();
+
+        let error = request.effective_tools().unwrap_err();
+        assert_eq!(error.reason, DynamicToolErrorReason::NotAFunctionTool);
+        assert_eq!(
+            error.to_string(),
+            "messages[0].tools[1] is not a function tool."
+        );
+    }
+
+    #[test]
+    fn effective_tools_rejects_every_shape_the_provider_rejects() {
+        for entry in [
+            serde_json::json!("not an object"),
+            serde_json::json!({"function": {"name": "no_type"}}),
+            serde_json::json!({"type": "function"}),
+            serde_json::json!({"type": "function", "function": {"description": "no name"}}),
+            serde_json::json!({"name": 7}),
+        ] {
+            let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "dummy-kimi-model",
+                "messages": [
+                    {"role": "user", "content": "go"},
+                    {"role": "system", "tools": [entry]}
+                ]
+            }))
+            .unwrap();
+
+            let error = request.effective_tools().unwrap_err();
+            assert_eq!(error.location, "messages[1].tools[0]");
+        }
+    }
+
+    #[test]
+    fn effective_tools_keeps_unknown_keys_on_the_entry_it_reads_from() {
+        let payload = serde_json::json!({
+            "model": "dummy-kimi-model",
+            "messages": [
+                {
+                    "role": "system",
+                    "tools": [{
+                        "type": "function",
+                        "vendor_hint": "kept",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {"type": "object", "x-vendor": "kept too"},
+                            "vendor_flag": true
+                        }
+                    }]
+                },
+                {"role": "user", "content": "go"}
+            ]
+        });
+        let request: CreateChatCompletionRequest = serde_json::from_value(payload.clone()).unwrap();
+
+        let effective = request.effective_tools().unwrap();
+        assert_eq!(effective[0].function.name, "lookup");
+        assert_eq!(
+            effective[0].function.parameters.as_ref().unwrap()["x-vendor"],
+            "kept too",
+            "schema extensions survive: parameters is carried as raw JSON"
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["messages"][0]["tools"],
+            payload["messages"][0]["tools"],
+            "the declaration the view read from is unchanged, unknown keys included"
+        );
+    }
+
+    #[test]
+    fn effective_tools_repeats_a_name_declared_twice_rather_than_collapsing_it() {
+        // A duplicate name is refused where declarations are rendered. Merging
+        // it away here would drop a declaration the caller sent.
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "dummy-kimi-model",
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "messages": [
+                {"role": "system", "tools": [{"name": "lookup"}]},
+                {"role": "user", "content": "go"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(request.effective_tools().unwrap().len(), 2);
     }
 
     #[test]
