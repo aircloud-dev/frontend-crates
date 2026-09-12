@@ -41,6 +41,25 @@ const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 /// `image_prompts` is the model author's hook for exactly this choice, and
 /// `<|kimi_image_placeholder|>` is only its `None` fallback.
 const MEDIA_PAD: &str = "<|media_pad|>";
+/// The one marker this renderer emits per video.
+///
+/// The checkpoint defines no video marker, and neither does vLLM's K3
+/// processor: video for this model exists only as unmerged work
+/// (sgl-project/sglang#35325, moonshotai/Kimi-K3 discussion 172), and every
+/// published engine refuses the modality. A worker that does support it
+/// registers a video `PromptReplacement` targeting exactly this string.
+///
+/// It must differ from [`MEDIA_PAD`] because vLLM counts replacement targets
+/// per modality: under one shared marker an image and a video in the same
+/// message both claim occurrence zero, and one of them is never expanded. A
+/// distinct marker keeps the counts independent and keeps each item where the
+/// caller put it.
+///
+/// Encoded as ordinary text in its own segment, because unlike the pad it is
+/// absent from the vocabulary: it matches only because the prompt and the
+/// worker BPE the same bytes, and its own segment keeps that encoding isolated
+/// from neighbouring prose.
+const VIDEO_PLACEHOLDER: &str = "<|kimi_video_placeholder|>";
 const VALID_THINKING_EFFORTS: &[&str] = &["low", "high", "max"];
 /// Tokens in the prefilled channel opener, which the API must not bill.
 ///
@@ -472,6 +491,7 @@ fn render_content_segments(
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
                     Some("image" | "image_url") => control(segments, MEDIA_PAD),
+                    Some("video" | "video_url") => text(segments, VIDEO_PLACEHOLDER),
                     _ => {
                         if let Some(part_text) = part.get("text") {
                             text(segments, value_as_body_text(part_text)?);
@@ -1290,6 +1310,62 @@ mod tests {
                 segments
                     .iter()
                     .any(|segment| segment.text == body && !segment.allow_special)
+            );
+        }
+    }
+
+    #[test]
+    fn renders_one_video_placeholder_per_video() {
+        let mut request = Request::new(json!([{
+            "role": "user",
+            "content": [{"type": "video_url", "video_url": {"url": "http://example.com/v.mp4"}}]
+        }]));
+        request
+            .args
+            .insert("thinking".to_string(), Value::Bool(false));
+
+        let segments = image_segments(&fmt(), &request);
+
+        let matches: Vec<_> = segments
+            .iter()
+            .filter(|segment| segment.text == VIDEO_PLACEHOLDER)
+            .collect();
+        assert_eq!(matches.len(), 1, "exactly one marker per video");
+        // It must NOT be special: the marker is absent from the vocabulary, so
+        // only the ordinary path encodes the bytes the worker looks for.
+        assert!(!matches[0].allow_special);
+    }
+
+    #[test]
+    fn renders_image_and_video_markers_in_source_order() {
+        for (first, second) in [("image_url", "video_url"), ("video_url", "image_url")] {
+            let part = |kind: &str| json!({"type": kind, kind: {"url": "http://example.com/m"}});
+            let mut request = Request::new(json!([{
+                "role": "user",
+                "content": [part(first), {"type": "text", "text": "describe both"}, part(second)]
+            }]));
+            request
+                .args
+                .insert("thinking".to_string(), Value::Bool(false));
+
+            let segments = image_segments(&fmt(), &request);
+            let markers: Vec<&str> = segments
+                .iter()
+                .filter(|segment| segment.text == MEDIA_PAD || segment.text == VIDEO_PLACEHOLDER)
+                .map(|segment| segment.text.as_str())
+                .collect();
+
+            let expected = |kind: &str| {
+                if kind == "image_url" {
+                    MEDIA_PAD
+                } else {
+                    VIDEO_PLACEHOLDER
+                }
+            };
+            assert_eq!(
+                markers,
+                [expected(first), expected(second)],
+                "one marker per item, in the order the caller sent them"
             );
         }
     }
