@@ -23,24 +23,36 @@ const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
 const SEP_TOKEN: &str = "<|sep|>";
 const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
-/// The one token this renderer emits per image.
+/// The one marker this renderer emits per image.
 ///
-/// This is the canonical frontend contract: exactly one `<|media_pad|>` per
-/// image, for every engine. It is a registered special token in the K3
-/// tokenizer (`config.json`'s `media_placeholder_token_id`), so it encodes to
-/// a single id and stays one id no matter what surrounds it.
+/// Exactly one `<|kimi_image_placeholder|>` per image, as ordinary text. This
+/// is `config.json`'s `image_placeholder`, and it is the string the vLLM
+/// worker looks for: its K3 processor registers a single
+/// `PromptReplacement { target: hf_config.image_placeholder, .. }` and expands
+/// each occurrence, resolution-aware, into
+/// `<|media_begin|>image {w}x{h}<|media_content|>{pads}<|media_end|>`, where
+/// `pads` is `<|media_pad|>` repeated `media_tokens_calculator(..)` times
+/// (`vllm/models/kimi_k3/common/mm_preprocess.py::_get_prompt_updates`,
+/// v0.28.0). The expansion is the worker's and must not be pre-rendered here:
+/// doing so leaves no target to replace and double-counts the media block.
 ///
-/// The checkpoint's other spelling, `<|kimi_image_placeholder|>`, is a plain
-/// string that is *not* in the vocabulary — it BPE-shatters into several ids
-/// whose boundaries depend on neighbouring text. Engines that want that form
-/// (vLLM) convert from the pad on the worker side, where a single known id is
-/// a reliable thing to substitute; matching a shattered string is not.
+/// Not a control segment, deliberately. The placeholder is absent from the
+/// vocabulary — `tokenizer_config.json` registers `<|media_pad|>` but not this
+/// — so it BPE-shatters, and matching works only because the worker encodes
+/// the same string the same way. Its own segment keeps that encoding isolated
+/// from neighbouring prose, which is what makes the shattered id run stable;
+/// `push_segment` never merges, so this holds by construction.
 ///
-/// Equivalent to calling the checkpoint's own
-/// `encoding_k3.build_chat_segments(image_prompts=["<|media_pad|>"] * n)` —
-/// `image_prompts` is the model author's hook for exactly this choice, and
-/// `<|kimi_image_placeholder|>` is only its `None` fallback.
-const MEDIA_PAD: &str = "<|media_pad|>";
+/// This is a divergence from the position this renderer took upstream, which
+/// is that `<|media_pad|>` is the canonical frontend contract for every engine
+/// because it is a registered token that encodes to one id, and that engines
+/// wanting the placeholder should convert from the pad worker-side. That
+/// reasoning is sound and the worker-side conversion is the durable fix; it
+/// simply does not exist on the way into the worker we run. The pad is what
+/// the expansion produces, not what it consumes, so with the pad in the prompt
+/// no image is ever given embedding slots and every vision request fails: all
+/// 11 vendored `k3_vision_*` prompt-token cases returned HTTP 500.
+const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 /// The one marker this renderer emits per video.
 ///
 /// The checkpoint defines no video marker, and neither does vLLM's K3
@@ -49,7 +61,7 @@ const MEDIA_PAD: &str = "<|media_pad|>";
 /// published engine refuses the modality. A worker that does support it
 /// registers a video `PromptReplacement` targeting exactly this string.
 ///
-/// It must differ from [`MEDIA_PAD`] because vLLM counts replacement targets
+/// It must differ from [`IMAGE_PLACEHOLDER`] because vLLM counts replacement targets
 /// per modality: under one shared marker an image and a video in the same
 /// message both claim occurrence zero, and one of them is never expanded. A
 /// distinct marker keeps the counts independent and keeps each item where the
@@ -490,7 +502,7 @@ fn render_content_segments(
         Value::Array(parts) => {
             for part in parts {
                 match part.get("type").and_then(Value::as_str) {
-                    Some("image" | "image_url") => control(segments, MEDIA_PAD),
+                    Some("image" | "image_url") => text(segments, IMAGE_PLACEHOLDER),
                     Some("video" | "video_url") => text(segments, VIDEO_PLACEHOLDER),
                     _ => {
                         if let Some(part_text) = part.get("text") {
@@ -1150,10 +1162,14 @@ mod tests {
         }
     }
 
-    /// Default formatter: no worker declaration, so the checkpoint token.
     fn fmt() -> KimiK3Formatter {
         KimiK3Formatter::new()
     }
+
+    /// `<|media_pad|>` is what the worker's expansion *produces*. The renderer
+    /// must never emit it: it is not the replacement target, so a prompt
+    /// carrying it gets no media block at all.
+    const MEDIA_PAD: &str = "<|media_pad|>";
 
     /// One user message carrying a single image part.
     fn image_request() -> Request {
@@ -1260,23 +1276,24 @@ mod tests {
     }
 
     #[test]
-    fn renders_one_media_pad_per_image() {
+    fn renders_one_image_placeholder_per_image() {
         let segments = image_segments(&fmt(), &image_request());
 
         let matches: Vec<_> = segments
             .iter()
-            .filter(|segment| segment.text == MEDIA_PAD)
+            .filter(|segment| segment.text == IMAGE_PLACEHOLDER)
             .collect();
-        assert_eq!(matches.len(), 1, "exactly one pad per image");
-        // The pad MUST stay special: it is a registered token, and only the
-        // special-aware encode path yields its single id.
-        assert!(matches[0].allow_special);
-        // The checkpoint's non-vocabulary spelling must never be emitted --
-        // the vLLM worker converts from the pad instead.
+        assert_eq!(matches.len(), 1, "exactly one placeholder per image");
+        // It must NOT be special. The placeholder is absent from the
+        // vocabulary, so it matches the worker's target only when both sides
+        // BPE the same string; the special-aware path does not encode it.
         assert!(
-            !segments
-                .iter()
-                .any(|segment| segment.text.contains("kimi_image_placeholder")),
+            !matches[0].allow_special,
+            "the placeholder is not a registered token and must encode as text"
+        );
+        assert!(
+            !segments.iter().any(|segment| segment.text == MEDIA_PAD),
+            "the renderer must not emit the pad the worker expands into"
         );
     }
 
@@ -1300,7 +1317,7 @@ mod tests {
         assert_eq!(
             segments
                 .iter()
-                .filter(|segment| segment.text == MEDIA_PAD)
+                .filter(|segment| segment.text == IMAGE_PLACEHOLDER)
                 .count(),
             2
         );
@@ -1351,13 +1368,15 @@ mod tests {
             let segments = image_segments(&fmt(), &request);
             let markers: Vec<&str> = segments
                 .iter()
-                .filter(|segment| segment.text == MEDIA_PAD || segment.text == VIDEO_PLACEHOLDER)
+                .filter(|segment| {
+                    segment.text == IMAGE_PLACEHOLDER || segment.text == VIDEO_PLACEHOLDER
+                })
                 .map(|segment| segment.text.as_str())
                 .collect();
 
             let expected = |kind: &str| {
                 if kind == "image_url" {
-                    MEDIA_PAD
+                    IMAGE_PLACEHOLDER
                 } else {
                     VIDEO_PLACEHOLDER
                 }
