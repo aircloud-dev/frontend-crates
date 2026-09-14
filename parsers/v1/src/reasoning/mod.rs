@@ -2001,4 +2001,212 @@ mod tests {
         assert_eq!(all_reasoning, "Weighing options.");
         assert_eq!(all_content, "Beijing is sunny.");
     }
+
+    // ---------------------------------------------------------------------
+    // Probe: bare `<|close|>` force-exit token vs the channel-qualified jail.
+    // Added to test the claim that a `<|close|>` not followed by a recognised
+    // channel name leaks the literal token into client-visible content.
+    // ---------------------------------------------------------------------
+
+    fn parse_batch_kimi_k3(
+        completion: &str,
+    ) -> (String, Vec<crate::tool_calling::ToolCallResponse>, String) {
+        let mut parser = ReasoningParserType::KimiK3.get_reasoning_parser();
+        parser.set_in_reasoning(true);
+        let parsed = parser.detect_and_parse_reasoning(completion, &[]);
+        let (calls, content) = crate::tool_calling::try_tool_call_parse_kimi_k3(
+            &parsed.normal_text,
+            &crate::tool_calling::KimiK3ParserConfig::default(),
+            None,
+        )
+        .unwrap();
+        (
+            parsed.reasoning_text,
+            calls,
+            content.unwrap_or_default(),
+        )
+    }
+
+    /// Print-and-assert probe: reports the observed strings for one completion
+    /// in batch, whole-chunk streamed, and every byte split.
+    fn probe_bare_close(label: &str, completion: &str) {
+        let (r, c, content) = parse_batch_kimi_k3(completion);
+        println!("[{label}] BATCH     reasoning={r:?} content={content:?} calls={}", c.len());
+        let (r, c, content) = parse_streamed_kimi_k3_chunks(&[completion]);
+        println!("[{label}] STREAM-1  reasoning={r:?} content={content:?} calls={}", c.len());
+        let marker = "<|close|>";
+        if let Some(at) = completion.find(marker) {
+            for cut in 1..marker.len() {
+                let split = at + cut;
+                let (r, c, content) = parse_streamed_kimi_k3(completion, split);
+                println!(
+                    "[{label}] SPLIT@{split:<3} reasoning={r:?} content={content:?} calls={}",
+                    c.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probe_bare_close_all_cases() {
+        probe_bare_close("a-garbage", "reasoning text<|close|>just some garbage");
+        probe_bare_close(
+            "b-unknown-channel",
+            "reasoning text<|close|>answer<|sep|>text",
+        );
+        probe_bare_close("c-trailing", "reasoning text<|close|>");
+        probe_bare_close(
+            "d-control",
+            "reasoning text<|close|>think<|sep|><|open|>response<|sep|>Hello",
+        );
+    }
+
+    /// (d) control: the well-formed shape must come back clean, proving the
+    /// harness itself is right.
+    #[test]
+    fn test_bare_close_control_wellformed_is_clean() {
+        const LIVE: &str =
+            "reasoning text<|close|>think<|sep|><|open|>response<|sep|>Hello";
+        let (r, calls, content) = parse_batch_kimi_k3(LIVE);
+        assert_eq!(r, "reasoning text");
+        assert!(calls.is_empty());
+        assert_eq!(content, "Hello");
+        let (r, calls, content) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert_eq!(r, "reasoning text");
+        assert!(calls.is_empty());
+        assert_eq!(content, "Hello");
+        assert_kimi_k3_all_splits(LIVE, |split, reasoning, calls, content| {
+            assert_eq!(reasoning, "reasoning text", "split at byte {split}");
+            assert!(calls.is_empty(), "split at byte {split}");
+            assert_eq!(content, "Hello", "split at byte {split}");
+        });
+    }
+
+    /// (a) `<|close|>` followed immediately by garbage, no channel name.
+    #[test]
+    fn test_bare_close_then_garbage_does_not_leak_marker() {
+        const LIVE: &str = "reasoning text<|close|>just some garbage";
+        let (_, _, content) = parse_batch_kimi_k3(LIVE);
+        assert!(
+            !content.contains("<|close|>"),
+            "batch content leaked the literal marker: {content:?}"
+        );
+        let (_, _, content) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert!(
+            !content.contains("<|close|>"),
+            "streamed content leaked the literal marker: {content:?}"
+        );
+        assert_kimi_k3_all_splits(LIVE, |split, _r, _calls, content| {
+            assert!(
+                !content.contains("<|close|>"),
+                "split at byte {split} leaked the literal marker: {content:?}"
+            );
+        });
+    }
+
+    /// (b) `<|close|>` followed by an unrecognised channel name.
+    #[test]
+    fn test_bare_close_unrecognised_channel_does_not_leak_marker() {
+        const LIVE: &str = "reasoning text<|close|>answer<|sep|>text";
+        let (_, _, content) = parse_batch_kimi_k3(LIVE);
+        assert!(
+            !content.contains("<|close|>"),
+            "batch content leaked the literal marker: {content:?}"
+        );
+        let (_, _, content) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert!(
+            !content.contains("<|close|>"),
+            "streamed content leaked the literal marker: {content:?}"
+        );
+        assert_kimi_k3_all_splits(LIVE, |split, _r, _calls, content| {
+            assert!(
+                !content.contains("<|close|>"),
+                "split at byte {split} leaked the literal marker: {content:?}"
+            );
+        });
+    }
+
+    /// (c) `<|close|>` at the very end of the generation, nothing after it.
+    #[test]
+    fn test_bare_close_at_eos_does_not_leak_marker() {
+        const LIVE: &str = "reasoning text<|close|>";
+        let (_, _, content) = parse_batch_kimi_k3(LIVE);
+        assert!(
+            !content.contains("<|close|>"),
+            "batch content leaked the literal marker: {content:?}"
+        );
+        let (_, _, content) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert!(
+            !content.contains("<|close|>"),
+            "streamed content leaked the literal marker: {content:?}"
+        );
+        assert_kimi_k3_all_splits(LIVE, |split, _r, _calls, content| {
+            assert!(
+                !content.contains("<|close|>"),
+                "split at byte {split} leaked the literal marker: {content:?}"
+            );
+        });
+    }
+
+    /// Field shape: a close followed by a real channel name but NO `<|sep|>`,
+    /// so it is not a qualified marker. Observed in the 2026-09-14 K3 campaign
+    /// (in a generation independently classified as degenerate).
+    #[test]
+    fn test_bare_close_then_channel_name_without_sep_does_not_leak_marker() {
+        const LIVE: &str = "Last exact. Use. Ensure.<|close|>think Need maybe phrase \"15 - j105.";
+        let (_, _, content) = parse_batch_kimi_k3(LIVE);
+        assert!(
+            !content.contains("<|close|>"),
+            "batch content leaked the literal marker: {content:?}"
+        );
+        assert!(
+            content.contains("Need maybe phrase"),
+            "the trailing text was dropped: {content:?}"
+        );
+        let (_, _, streamed) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert_eq!(streamed, content, "batch and streamed disagree");
+        assert_kimi_k3_all_splits(LIVE, |split, _r, _calls, content| {
+            assert!(
+                !content.contains("<|close|>"),
+                "split at byte {split} leaked the literal marker: {content:?}"
+            );
+        });
+    }
+
+    /// Field shape: a bare `<|open|>` mid-answer. Same defect class as the bare
+    /// close -- the unqualified reserved token matches no jail boundary.
+    #[test]
+    fn test_bare_open_does_not_leak_marker() {
+        const LIVE: &str = "reasoning text<|close|>think<|sep|><|open|>response<|sep|>An answer.<|open|>[^1] and more";
+        let (_, _, content) = parse_batch_kimi_k3(LIVE);
+        assert!(
+            !content.contains("<|open|>"),
+            "batch content leaked the literal marker: {content:?}"
+        );
+        assert!(
+            content.contains("An answer.") && content.contains("and more"),
+            "text around the stray marker was dropped: {content:?}"
+        );
+        let (_, _, streamed) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert_eq!(streamed, content, "batch and streamed disagree");
+    }
+
+    /// (e) both-channels-empty: a bare `<|close|>` whose tail happens to contain
+    /// a jailed boundary drops the whole logical span, so neither channel
+    /// carries the answer.
+    #[test]
+    fn test_bare_close_then_answer_keeps_the_answer_somewhere() {
+        const LIVE: &str = "reasoning text<|close|>391<|close|>tools<|sep|>";
+        let (reasoning, _, content) = parse_batch_kimi_k3(LIVE);
+        assert!(
+            reasoning.contains("391") || content.contains("391"),
+            "the answer vanished: reasoning={reasoning:?} content={content:?}"
+        );
+        let (reasoning, _, content) = parse_streamed_kimi_k3_chunks(&[LIVE]);
+        assert!(
+            reasoning.contains("391") || content.contains("391"),
+            "the answer vanished: reasoning={reasoning:?} content={content:?}"
+        );
+    }
+
 }

@@ -171,6 +171,7 @@ pub fn try_tool_call_parse_kimi_k3(
 ) -> anyhow::Result<(Vec<ToolCallResponse>, Option<String>)> {
     let normalized = normalize_spaced_markers(message);
     let sanitized = strip_orphan_think_close(normalized.as_ref());
+    let sanitized = strip_stray_control_markers(sanitized.as_ref());
     let message = sanitized.as_ref();
     let normal_text = extract_response_text(message);
     let calls = extract_calls(message, config);
@@ -182,6 +183,62 @@ fn strip_orphan_think_close(message: &str) -> Cow<'_, str> {
         return Cow::Borrowed(message);
     }
     Cow::Owned(message.replace(THINK_CLOSE, ""))
+}
+
+/// Reserved control tokens that only ever carry meaning in a channel-qualified
+/// form such as `<|close|>think<|sep|>` or `<|open|>response<|sep|>`.
+const UNQUALIFIED_CONTROL_MARKERS: [&str; 2] = ["<|open|>", "<|close|>"];
+
+/// Drop a reserved control token that does not begin a recognised K3 channel
+/// marker.
+///
+/// The reasoning parser force-exits on the bare `<|open|>` / `<|close|>` tokens,
+/// but [`JAIL_BOUNDARIES`] only lists their channel-qualified spellings, so an
+/// unqualified one reached client-visible content verbatim. These are reserved
+/// structural tokens with no meaning on their own, so the token itself is
+/// removed while everything around it is kept: text the model produced is never
+/// discarded to sanitize markup.
+///
+/// Whether a healthy K3 ever emits an unqualified marker is unestablished --
+/// every observed instance accompanied a degenerate generation -- so this is a
+/// containment measure, not a decode of some documented form.
+fn strip_stray_control_markers(message: &str) -> Cow<'_, str> {
+    if !message.contains("<|") {
+        return Cow::Borrowed(message);
+    }
+
+    let mut out: Option<String> = None;
+    // Source offset up to which the output already holds a verbatim copy.
+    let mut copied = 0;
+    let mut cursor = 0;
+    while let Some(found) = earliest_position(&message[cursor..], &UNQUALIFIED_CONTROL_MARKERS) {
+        let at = cursor + found;
+        let rest = &message[at..];
+        // A qualified marker owns this position; the jail handles it downstream.
+        if JAIL_BOUNDARIES
+            .iter()
+            .any(|boundary| rest.starts_with(boundary))
+        {
+            cursor = at + "<|".len();
+            continue;
+        }
+        let token = UNQUALIFIED_CONTROL_MARKERS
+            .iter()
+            .find(|token| rest.starts_with(*token))
+            .expect("earliest_position matched one of the control markers");
+        let buffer = out.get_or_insert_with(String::new);
+        buffer.push_str(&message[copied..at]);
+        cursor = at + token.len();
+        copied = cursor;
+    }
+
+    match out {
+        Some(mut buffer) => {
+            buffer.push_str(&message[copied..]);
+            Cow::Owned(buffer)
+        }
+        None => Cow::Borrowed(message),
+    }
 }
 
 fn normalize_spaced_markers(message: &str) -> Cow<'_, str> {
@@ -274,10 +331,17 @@ fn extract_response_text(message: &str) -> String {
         return strip_leading_message_open(&logical[..tools]).to_string();
     }
 
-    if first_marker(logical).is_some()
-        || logical.contains(TOOLS_CLOSE)
-        || logical.contains(CALL_CLOSE)
-    {
+    // An unrecognised arrangement of reserved markers: everything from the
+    // first marker on is structure this function cannot interpret, but the text
+    // in front of it is ordinary model output. Returning the whole span empty
+    // used to discard that prefix -- a silently dropped answer is a worse
+    // failure than a span of epilogue, so keep the plain leading text.
+    if let Some((position, _)) = first_marker(logical) {
+        return strip_leading_message_open(&logical[..position])
+            .trim_end()
+            .to_string();
+    }
+    if logical.contains(TOOLS_CLOSE) || logical.contains(CALL_CLOSE) {
         return String::new();
     }
 

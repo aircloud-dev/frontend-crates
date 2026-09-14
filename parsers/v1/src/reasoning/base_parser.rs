@@ -729,6 +729,19 @@ impl ReasoningParser for BasicReasoningParser {
 
         let buffered = std::mem::take(&mut self._buffer);
         if self._in_reasoning {
+            // A complete force-exit marker can be held back mid-stream because
+            // it is also a prefix of the reasoning close (Kimi K3's `<|close|>`
+            // inside `<|close|>think<|sep|>`). At EOS nothing will arrive to
+            // settle that, and the batch path resolves the same bytes as a
+            // force exit -- so resolve it the same way here rather than
+            // flushing parser-owned markup into `reasoning_content`, which made
+            // one input produce two different client-visible results.
+            if let Some(marker_at) = earliest_marker_offset(&buffered, &self.tool_start_tokens) {
+                return ParserResult {
+                    normal_text: buffered[marker_at..].to_string(),
+                    reasoning_text: buffered[..marker_at].to_string(),
+                };
+            }
             ParserResult {
                 normal_text: String::new(),
                 reasoning_text: buffered,
