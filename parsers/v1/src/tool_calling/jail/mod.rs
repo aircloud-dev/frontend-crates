@@ -38,6 +38,7 @@ use dynamo_protocols::types::{
 };
 use futures::{Stream, StreamExt};
 use serde_json::value::RawValue;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -1062,6 +1063,36 @@ impl ChoiceJailState {
             }
         } else if !self.partial_match_buffer.is_empty() {
             let content = std::mem::take(&mut self.partial_match_buffer);
+            // The stream ended while this text was still held as a candidate
+            // marker prefix (e.g. "<|close|>think" with no trailing
+            // "<|sep|>" because generation stopped first). By construction
+            // this buffer holds *only* the candidate marker text -- any text
+            // before it was already split off and emitted separately (see
+            // `kimi_k3_abrupt_eof_preserves_incomplete_boundary_prefix`,
+            // where "answer" and "<|clo" reach the client as two separate
+            // emissions). That is what makes it safe to drop the buffer
+            // whole when it is nothing but a reserved token plus a prefix of
+            // that channel's continuation: unlike `sanitize_kimi_k3_content`
+            // elsewhere, which never discards text because it cannot tell
+            // protocol framing from real content mixed into the same chunk,
+            // a buffer that qualifies here cannot be anything but framing.
+            // Otherwise -- a genuinely still-partial fragment like "<|clo"
+            // with no complete token in it -- fall back to the same
+            // strip-only policy as every other content emission; never
+            // silently discard text that isn't provably ours.
+            let content = if is_kimi_k3_parser(jail_stream.tool_call_parser.as_deref()) {
+                if crate::tool_calling::xtml::is_kimi_k3_truncated_marker(&content) {
+                    String::new()
+                } else if let Cow::Owned(sanitized) =
+                    crate::tool_calling::xtml::sanitize_kimi_k3_content(&content)
+                {
+                    sanitized
+                } else {
+                    content
+                }
+            } else {
+                content
+            };
             let choice = create_choice_stream(
                 self.index,
                 Some(Role::Assistant),
@@ -1443,6 +1474,40 @@ impl JailedStream {
     }
 
     /// Emit choice emissions based on the configured emission mode
+    /// Strip a reserved K3 control token (`<|open|>`, `<|close|>`) that never
+    /// completed into a recognized channel marker, right before content
+    /// this stream has already decided to emit as-is reaches the client.
+    ///
+    /// Every non-jailed content-bearing emission funnels through
+    /// `emit_choice_emissions` -- pass-through, jailed trailing content, and
+    /// a marker that started and then definitively diverged (e.g.
+    /// `"<|close|>."`, which can never become a configured marker and so
+    /// never gets jailed in the first place; see `should_start_jail`). This
+    /// is the single chokepoint rather than sanitizing at each call site, so
+    /// a future content-emission path added here inherits the same
+    /// protection without having to remember to add it. A separate,
+    /// narrower fix handles `finalize`'s end-of-stream `partial_match_buffer`
+    /// flush, which holds text that might still complete a marker and so
+    /// cannot be run through this same strip (see its own comment).
+    fn sanitize_kimi_k3_emissions(&self, emissions: Vec<ChoiceEmission>) -> Vec<ChoiceEmission> {
+        if !is_kimi_k3_parser(self.tool_call_parser.as_deref()) {
+            return emissions;
+        }
+        emissions
+            .into_iter()
+            .map(|mut emission| {
+                if let Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) =
+                    emission.choice_mut().delta.content.as_mut()
+                    && let Cow::Owned(sanitized) =
+                        crate::tool_calling::xtml::sanitize_kimi_k3_content(text)
+                {
+                    *text = sanitized;
+                }
+                emission
+            })
+            .collect()
+    }
+
     fn emit_choice_emissions(
         &self,
         emissions: Vec<ChoiceEmission>,
@@ -1453,6 +1518,7 @@ impl JailedStream {
             return Vec::new();
         }
 
+        let emissions = self.sanitize_kimi_k3_emissions(emissions);
         let (id, event, comment) = annotated_metadata;
 
         match self.emission_mode {
@@ -3253,6 +3319,116 @@ mod tests {
         .await;
 
         assert_eq!(collect_text_content(&responses), "answer");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    // Regression coverage for the production bare-`<|close|>` leak: a
+    // malformed or truncated close marker that never completes into a
+    // recognized channel boundary must never reach the client with the
+    // reserved token still attached. See `sanitize_kimi_k3_emissions` and
+    // `finalize`'s `partial_match_buffer` handling.
+
+    #[tokio::test]
+    async fn kimi_k3_jail_strips_malformed_close_followed_by_garbage() {
+        // Observed production shape: "<|close|>." -- the model emitted the
+        // reserved token, then bytes that never complete any configured
+        // marker. Never gets jailed at all (see `detect_tool_call_start_kimi_k3`),
+        // so this exercises the `MatchResult::None` pass-through path.
+        let responses = apply_kimi_k3(vec![text_chunk("<|close|>.")]).await;
+
+        assert_eq!(collect_text_content(&responses), ".");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_strips_malformed_close_with_trailing_whitespace() {
+        // Observed production shape: "<|close|>\n\n\n".
+        let responses = apply_kimi_k3(vec![text_chunk("<|close|>\n\n\n")]).await;
+
+        assert_eq!(collect_text_content(&responses), "\n\n\n");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_strips_doubled_close_marker() {
+        // Observed production shape: "<|close|><|close|>" -- two consecutive
+        // stray tokens, neither completing a marker.
+        let responses = apply_kimi_k3(vec![text_chunk("<|close|><|close|>")]).await;
+
+        assert_eq!(collect_text_content(&responses), "");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_strips_malformed_close_ahead_of_a_real_marker_in_one_chunk() {
+        // A single backend delta carrying a stray close immediately followed
+        // by a well-formed response channel. The stray prefix is emitted via
+        // the `MatchResult::Complete` prefix path (jail/mod.rs), not the
+        // `None` path the other cases above exercise.
+        let responses =
+            apply_kimi_k3(vec![text_chunk("<|close|>.\n<|close|>response<|sep|>hi")]).await;
+
+        assert_eq!(collect_text_content(&responses), ".\nhi");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_eof_with_truncated_close_marker_is_dropped() {
+        // Generation ends (no more chunks) while "<|close|>think" is held as
+        // a candidate marker prefix in `partial_match_buffer` -- the
+        // production shape behind the observed "think"-suffix leaks. This
+        // buffer holds nothing but a complete reserved token plus a prefix
+        // of that channel's continuation, so it cannot be anything but
+        // protocol framing the stream cut off mid-formation (see
+        // `is_kimi_k3_truncated_marker`'s doc comment for why that is safe
+        // to conclude only here) -- it is dropped whole rather than
+        // stripped down to the bare channel keyword "think", which would
+        // otherwise look like a real one-word answer.
+        let responses = apply_kimi_k3(vec![text_chunk("<|close|>think")]).await;
+
+        assert_eq!(collect_text_content(&responses), "");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_eof_with_pure_partial_prefix_is_preserved_untouched() {
+        // A buffer holding only a genuine, still-ambiguous partial byte
+        // sequence (no complete reserved token present) must not be touched
+        // at all -- this is the abrupt-EOF case covered end-to-end below,
+        // repeated here directly against `finalize`'s sanitize call to pin
+        // the boundary between "strip" and "leave alone".
+        let responses = apply_kimi_k3(vec![text_chunk("answer<|clo")]).await;
+
+        assert_eq!(collect_text_content(&responses), "answer<|clo");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_preserves_spaced_malformed_close_wire_variant() {
+        // vLLM normally disables inter-special-token spacing for K3, but the
+        // sanitizer must not mangle the spaced wire form if another engine
+        // ever leaves it on: `strip_stray_control_markers` alone (without
+        // `normalize_spaced_markers` first) would see "<|close|> response
+        // <|sep|>" as an unqualified marker (its boundary table only holds
+        // canonical spellings) and corrupt it.
+        let responses = apply_kimi_k3(vec![text_chunk("<|close|> response <|sep|>ok")]).await;
+
+        assert_eq!(collect_text_content(&responses), "ok");
+        assert!(collect_tool_calls(&responses).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kimi_k3_jail_reassembles_a_real_marker_split_mid_token() {
+        // A real marker split across chunks such that one chunk ends inside
+        // the reserved token itself must still be recognized whole, not
+        // stripped as if the first fragment were stray.
+        let responses = apply_kimi_k3(vec![
+            text_chunk("hi<|clo"),
+            text_chunk("se|>response<|sep|>there"),
+        ])
+        .await;
+
+        assert_eq!(collect_text_content(&responses), "hithere");
         assert!(collect_tool_calls(&responses).is_empty());
     }
 

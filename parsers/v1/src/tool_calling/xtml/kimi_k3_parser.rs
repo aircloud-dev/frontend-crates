@@ -202,7 +202,7 @@ const UNQUALIFIED_CONTROL_MARKERS: [&str; 2] = ["<|open|>", "<|close|>"];
 /// Whether a healthy K3 ever emits an unqualified marker is unestablished --
 /// every observed instance accompanied a degenerate generation -- so this is a
 /// containment measure, not a decode of some documented form.
-fn strip_stray_control_markers(message: &str) -> Cow<'_, str> {
+pub(crate) fn strip_stray_control_markers(message: &str) -> Cow<'_, str> {
     if !message.contains("<|") {
         return Cow::Borrowed(message);
     }
@@ -241,7 +241,60 @@ fn strip_stray_control_markers(message: &str) -> Cow<'_, str> {
     }
 }
 
-fn normalize_spaced_markers(message: &str) -> Cow<'_, str> {
+/// Sanitize a content chunk that the jail has already decided is final,
+/// client-visible text (never jailed, or jailed and released) -- as opposed
+/// to text still being held pending more bytes. Composes the same two steps
+/// [`try_tool_call_parse_kimi_k3`] applies to a complete jailed message, so a
+/// spaced-wire stray marker (`"<|close|> response <|sep|>"`) is recognized
+/// before the unqualified-marker check runs, not mangled by it.
+///
+/// Does not attempt to recover a marker that is still a genuine partial
+/// prefix (e.g. the tail of a chunk ending in `"<|clo"`) -- callers must only
+/// invoke this on text the jail will not hold for more bytes.
+pub(crate) fn sanitize_kimi_k3_content(text: &str) -> Cow<'_, str> {
+    match normalize_spaced_markers(text) {
+        Cow::Borrowed(text) => strip_stray_control_markers(text),
+        Cow::Owned(normalized) => match strip_stray_control_markers(&normalized) {
+            Cow::Borrowed(_) => Cow::Owned(normalized),
+            Cow::Owned(stripped) => Cow::Owned(stripped),
+        },
+    }
+}
+
+/// Whether `text` is nothing but a K3 reserved control token (`<|open|>` or
+/// `<|close|>`) followed by a proper prefix of that channel's continuation --
+/// i.e. a marker that started forming and then the stream ended before it
+/// could complete, such as `"<|close|>think"` with no trailing `"<|sep|>"`
+/// because generation stopped first.
+///
+/// Only meaningful on a jail's `partial_match_buffer` at end-of-stream, which
+/// by construction holds *only* the candidate marker text -- any text before
+/// it was already split off and emitted separately (see
+/// `kimi_k3_abrupt_eof_preserves_incomplete_boundary_prefix` in `jail::tests`,
+/// which is why that case sees `"answer"` and `"<|clo"` as two separate
+/// emissions rather than one combined buffer). That is what makes dropping
+/// this text whole safe here and nowhere else: unlike
+/// `sanitize_kimi_k3_content`, which never discards text because it cannot
+/// tell protocol framing from real content mixed into the same chunk, a
+/// buffer that satisfies this check cannot be anything else -- it has no
+/// bytes preceding the token, and every byte after it is a match against a
+/// real channel name. A buffer with no complete token at all (e.g.
+/// `"<|clo"`, five bytes into `"<|close|>"`) is still genuinely ambiguous
+/// and must return `false` here so it is left untouched instead.
+pub(crate) fn is_kimi_k3_truncated_marker(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    if !(text.starts_with("<|open|>") || text.starts_with("<|close|>")) {
+        return false;
+    }
+    KimiK3ParserConfig::default()
+        .start_tokens()
+        .iter()
+        .any(|marker| marker.starts_with(text))
+}
+
+pub(crate) fn normalize_spaced_markers(message: &str) -> Cow<'_, str> {
     // Keep the canonical production path allocation-free and avoid probing
     // every alias unless the engine-added spacing signature is present.
     if !message.contains("<|open|> ") && !message.contains("<|close|> ") {
